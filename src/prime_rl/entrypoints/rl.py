@@ -8,6 +8,8 @@ import uuid
 from pathlib import Path
 from subprocess import Popen
 from threading import Event, Thread
+from typing import Any, cast
+from urllib.parse import urlparse
 
 import pynvml
 import tomli_w
@@ -38,6 +40,13 @@ INFERENCE_TOML = "inference.toml"
 TEACHER_INFERENCE_TOML = "teacher_inference.toml"
 
 
+def dump_inference_config(config, output_path: Path) -> None:
+    """Write an inference config, excluding launcher-only fields."""
+    exclude_inference = {"deployment", "slurm", "output_dir", "dry_run"}
+    with open(output_path, "wb") as f:
+        tomli_w.dump(config.model_dump(exclude=exclude_inference, exclude_none=True, mode="json"), f)
+
+
 def get_physical_gpu_ids() -> list[int]:
     """Return physical GPU IDs visible to the launcher."""
     raw_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -66,10 +75,7 @@ def write_subconfigs(config: RLConfig, output_dir: Path) -> None:
         tomli_w.dump(config.orchestrator.model_dump(exclude_none=True, mode="json"), f)
 
     if config.inference is not None:
-        # Exclude launcher-only fields that are not needed by the vLLM server
-        exclude_inference = {"deployment", "slurm", "output_dir", "dry_run"}
-        with open(output_dir / INFERENCE_TOML, "wb") as f:
-            tomli_w.dump(config.inference.model_dump(exclude=exclude_inference, exclude_none=True, mode="json"), f)
+        dump_inference_config(config.inference, output_dir / INFERENCE_TOML)
 
     teacher_inference = getattr(config, "teacher_inference", None)
     if teacher_inference is not None:
@@ -97,16 +103,82 @@ def check_gpus_available(gpu_ids: list[int]) -> None:
         raise RuntimeError(msg)
 
 
+def _base_url_with_port(base_url: str, port: int) -> str:
+    parsed = urlparse(base_url)
+    assert parsed.scheme, f"Base URL must include a scheme: {base_url}"
+    assert parsed.hostname, f"Base URL must include a hostname: {base_url}"
+    assert parsed.path.rstrip("/") == "/v1", f"Base URL must end in /v1: {base_url}"
+    assert parsed.username is None and parsed.password is None, f"Base URL must not include credentials: {base_url}"
+    host = parsed.hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"{parsed.scheme}://{host}:{port}/v1"
+
+
+def configure_lora_inference_replicas(config: RLConfig) -> int:
+    """Use independent local inference servers for multi-GPU LoRA rollouts."""
+    if config.inference is None:
+        return 0
+    if not config.inference.enable_lora:
+        return 1
+    deployment = cast(Any, config.deployment)
+    if deployment.num_infer_gpus == config.inference.parallel.tp:
+        return 1
+
+    assert deployment.num_infer_gpus % config.inference.parallel.tp == 0, (
+        "Number of inference GPUs must be divisible by tensor parallel size"
+    )
+    replica_count = deployment.num_infer_gpus // config.inference.parallel.tp
+    assert replica_count > 1, f"Expected more than one LoRA inference replica, got {replica_count}"
+    assert len(config.orchestrator.client.base_url) == 1, (
+        "LoRA inference replica launcher expects one base URL before expansion"
+    )
+
+    base_port = config.inference.server.port
+    base_url = config.orchestrator.client.base_url[0]
+    config.orchestrator.client.base_url = [_base_url_with_port(base_url, base_port + idx) for idx in range(replica_count)]
+    if config.orchestrator.client.admin_base_url is not None:
+        assert len(config.orchestrator.client.admin_base_url) == 1, (
+            "LoRA inference replica launcher expects one admin base URL before expansion"
+        )
+        admin_base_url = config.orchestrator.client.admin_base_url[0]
+        config.orchestrator.client.admin_base_url = [
+            _base_url_with_port(admin_base_url, base_port + idx) for idx in range(replica_count)
+        ]
+    config.orchestrator.client.dp_rank_count = 1
+
+    config.inference.parallel.dp = 1
+    config.inference.data_parallel_size_local = 1
+    config.inference.api_server_count = 1
+    return replica_count
+
+
 def rl_local(config: RLConfig):
     assert config.deployment.type == "single_node"
+    deployment = cast(Any, config.deployment)
 
     logger = setup_logger(
         config.log.level or os.environ.get("PRIME_LOG_LEVEL", "info"),
         json_logging=config.log.json_logging,
     )
 
+    lora_inference_replica_count = configure_lora_inference_replicas(config)
+
     config_dir = config.output_dir / "configs"
     write_subconfigs(config, config_dir)
+    lora_inference_config_paths: list[Path] = []
+    if lora_inference_replica_count > 1:
+        assert config.inference is not None
+        for replica_idx in range(lora_inference_replica_count):
+            replica_config = config.inference.model_copy(deep=True)
+            replica_config.server.port = config.inference.server.port + replica_idx
+            replica_config_path = config_dir / f"inference_{replica_idx}.toml"
+            dump_inference_config(replica_config, replica_config_path)
+            lora_inference_config_paths.append(replica_config_path)
+        logger.info(
+            "Using independent LoRA inference replicas at "
+            f"{', '.join(config.orchestrator.client.base_url)}"
+        )
     logger.info(f"Wrote subconfigs to {config_dir}")
 
     if config.dry_run:
@@ -115,15 +187,15 @@ def rl_local(config: RLConfig):
 
     # Derive launcher-local GPU IDs from deployment config
     gpu_offset = 0
-    num_infer_gpus = config.deployment.num_infer_gpus if config.inference is not None else 0
+    num_infer_gpus = deployment.num_infer_gpus if config.inference is not None else 0
     infer_local_gpu_ids = list(range(gpu_offset, gpu_offset + num_infer_gpus))
     gpu_offset += num_infer_gpus
-    trainer_local_gpu_ids = list(range(gpu_offset, gpu_offset + config.deployment.num_train_gpus))
-    gpu_offset += config.deployment.num_train_gpus
-    num_teacher_gpus = config.deployment.num_teacher_gpus or 0
+    trainer_local_gpu_ids = list(range(gpu_offset, gpu_offset + deployment.num_train_gpus))
+    gpu_offset += deployment.num_train_gpus
+    num_teacher_gpus = deployment.num_teacher_gpus or 0
     teacher_local_gpu_ids = list(range(gpu_offset, gpu_offset + num_teacher_gpus)) if num_teacher_gpus > 0 else []
 
-    total_requested_gpus = num_infer_gpus + config.deployment.num_train_gpus + num_teacher_gpus
+    total_requested_gpus = num_infer_gpus + deployment.num_train_gpus + num_teacher_gpus
     physical_gpu_ids = get_physical_gpu_ids()
     if total_requested_gpus > len(physical_gpu_ids):
         raise ValueError(
@@ -187,32 +259,67 @@ def rl_local(config: RLConfig):
     try:
         # Optionally, start inference process
         if config.inference:
-            inference_cmd = ["inference", "@", (config_dir / INFERENCE_TOML).as_posix()]
-            logger.info(f"Starting inference on GPU(s) {' '.join(map(str, infer_gpu_ids))}")
-            logger.debug(f"Inference start command: {' '.join(inference_cmd)}")
-            # If we don't log stdout, the server hangs
-            with open(log_dir / "inference.log", "w") as log_file:
-                inference_process = Popen(
-                    inference_cmd,
-                    env={
-                        **os.environ,
-                        "CUDA_VISIBLE_DEVICES": ",".join(map(str, infer_gpu_ids)),
-                    },
-                    stdout=log_file,
-                    stderr=log_file,
+            if lora_inference_config_paths:
+                assert config.inference.parallel.tp == 1, "LoRA inference replica launcher currently expects TP=1"
+                assert len(lora_inference_config_paths) == len(infer_gpu_ids), (
+                    f"Expected one inference config per GPU, got {len(lora_inference_config_paths)} configs "
+                    f"and {len(infer_gpu_ids)} GPUs"
                 )
-            processes.append(inference_process)
+                for replica_idx, (replica_config_path, infer_gpu_id) in enumerate(
+                    zip(lora_inference_config_paths, infer_gpu_ids)
+                ):
+                    inference_cmd = ["inference", "@", replica_config_path.as_posix()]
+                    process_name = f"inference_{replica_idx}"
+                    logger.info(f"Starting {process_name} on GPU {infer_gpu_id}")
+                    logger.debug(f"{process_name} start command: {' '.join(inference_cmd)}")
+                    with open(log_dir / f"{process_name}.log", "w") as log_file:
+                        inference_process = Popen(
+                            inference_cmd,
+                            env={
+                                **os.environ,
+                                "CUDA_VISIBLE_DEVICES": str(infer_gpu_id),
+                            },
+                            stdout=log_file,
+                            stderr=log_file,
+                        )
+                    processes.append(inference_process)
 
-            # Start monitoring thread
-            stop_event = Event()
-            stop_events["inference"] = stop_event
-            monitor_thread = Thread(
-                target=monitor_process,
-                args=(inference_process, stop_event, error_queue, "inference"),
-                daemon=True,
-            )
-            monitor_thread.start()
-            monitor_threads.append(monitor_thread)
+                    stop_event = Event()
+                    stop_events[process_name] = stop_event
+                    monitor_thread = Thread(
+                        target=monitor_process,
+                        args=(inference_process, stop_event, error_queue, process_name),
+                        daemon=True,
+                    )
+                    monitor_thread.start()
+                    monitor_threads.append(monitor_thread)
+            else:
+                inference_cmd = ["inference", "@", (config_dir / INFERENCE_TOML).as_posix()]
+                logger.info(f"Starting inference on GPU(s) {' '.join(map(str, infer_gpu_ids))}")
+                logger.debug(f"Inference start command: {' '.join(inference_cmd)}")
+                # If we don't log stdout, the server hangs
+                with open(log_dir / "inference.log", "w") as log_file:
+                    inference_process = Popen(
+                        inference_cmd,
+                        env={
+                            **os.environ,
+                            "CUDA_VISIBLE_DEVICES": ",".join(map(str, infer_gpu_ids)),
+                        },
+                        stdout=log_file,
+                        stderr=log_file,
+                    )
+                processes.append(inference_process)
+
+                # Start monitoring thread
+                stop_event = Event()
+                stop_events["inference"] = stop_event
+                monitor_thread = Thread(
+                    target=monitor_process,
+                    args=(inference_process, stop_event, error_queue, "inference"),
+                    daemon=True,
+                )
+                monitor_thread.start()
+                monitor_threads.append(monitor_thread)
         else:
             if config.orchestrator.teacher_rollout_model is None:
                 logger.warning(
@@ -224,6 +331,7 @@ def rl_local(config: RLConfig):
                 )
 
         # Optionally, start teacher inference process
+        loss = cast(Any, config.trainer.loss)
         if config.teacher_inference:
             if not teacher_gpu_ids:
                 raise ValueError(
@@ -257,9 +365,7 @@ def rl_local(config: RLConfig):
             )
             monitor_thread.start()
             monitor_threads.append(monitor_thread)
-        elif (
-            config.trainer.loss.type == "default" and config.trainer.loss.teacher_tau > 0
-        ) or config.orchestrator.teacher_model:
+        elif (loss.type == "default" and loss.teacher_tau > 0) or config.orchestrator.teacher_model:
             logger.warning(
                 "No teacher_inference config specified, skipping starting teacher inference server. "
                 "Is your teacher inference server running? Make sure orchestrator.teacher_model is configured."
@@ -406,19 +512,20 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
 
     assert config.slurm is not None
     assert config.slurm.template_path is not None
+    deployment = cast(Any, config.deployment)
 
     env = Environment(loader=FileSystemLoader(config.slurm.template_path.parent), keep_trailing_newline=True)
     template = env.get_template(config.slurm.template_path.name)
 
-    if config.deployment.type == "single_node":
+    if deployment.type == "single_node":
         script = template.render(
             **config.slurm.template_vars,
             config_path=config_dir / RL_TOML,
             output_dir=config.output_dir,
-            gpus_per_node=config.deployment.gpus_per_node,
+            gpus_per_node=deployment.gpus_per_node,
         )
     elif config.inference is not None and config.inference.deployment.type == "disaggregated":
-        infer_deploy = config.inference.deployment
+        infer_deploy = cast(Any, config.inference.deployment)
 
         script = template.render(
             **config.slurm.template_vars,
@@ -426,15 +533,15 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
             config_dir=config_dir,
             output_dir=config.output_dir,
             orchestrator_output_dir=config.orchestrator.output_dir,
-            num_train_nodes=config.deployment.num_train_nodes,
-            num_infer_nodes=infer_deploy.num_nodes * config.deployment.num_infer_replicas,
+            num_train_nodes=deployment.num_train_nodes,
+            num_infer_nodes=infer_deploy.num_nodes * deployment.num_infer_replicas,
             nodes_per_infer_replica=infer_deploy.num_nodes,
-            num_infer_replicas=config.deployment.num_infer_replicas,
+            num_infer_replicas=deployment.num_infer_replicas,
             num_prefill_nodes=infer_deploy.num_prefill_nodes,
             num_decode_nodes=infer_deploy.num_decode_nodes,
             num_prefill_replicas=infer_deploy.num_prefill_replicas,
             num_decode_replicas=infer_deploy.num_decode_replicas,
-            gpus_per_node=config.deployment.gpus_per_node,
+            gpus_per_node=deployment.gpus_per_node,
             router_port=infer_deploy.router_port,
             prefill_port=infer_deploy.prefill_port,
             decode_port=infer_deploy.decode_port,
@@ -443,7 +550,7 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
             use_deep_gemm=config.inference.use_deep_gemm,
             prefill_env_overrides=infer_deploy.prefill_env_overrides,
             decode_env_overrides=infer_deploy.decode_env_overrides,
-            dp_per_node=config.deployment.gpus_per_node // config.inference.parallel.tp,
+            dp_per_node=deployment.gpus_per_node // config.inference.parallel.tp,
             kv_offload=infer_deploy.kv_cache_offload is not None,
             kv_offload_cpu_bytes=int(infer_deploy.kv_cache_offload.cpu_bytes) if infer_deploy.kv_cache_offload else 0,
             use_nccl_broadcast=config.weight_broadcast is not None and config.weight_broadcast.type == "nccl",
@@ -457,18 +564,18 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
             config_dir=config_dir,  # TODO: should prob have each subconfig path separately
             output_dir=config.output_dir,
             orchestrator_output_dir=config.orchestrator.output_dir,
-            num_train_nodes=config.deployment.num_train_nodes,
-            num_infer_nodes=config.deployment.total_infer_nodes,
-            nodes_per_infer_replica=config.deployment.num_infer_nodes,
-            num_infer_replicas=config.deployment.num_infer_replicas,
-            num_teacher_nodes=config.deployment.num_teacher_nodes,
-            gpus_per_node=config.deployment.gpus_per_node,
+            num_train_nodes=deployment.num_train_nodes,
+            num_infer_nodes=deployment.total_infer_nodes,
+            nodes_per_infer_replica=deployment.num_infer_nodes,
+            num_infer_replicas=deployment.num_infer_replicas,
+            num_teacher_nodes=deployment.num_teacher_nodes,
+            gpus_per_node=deployment.gpus_per_node,
             router_port=getattr(config.inference.deployment, "router_port", 8000) if config.inference else 8000,
             backend_port=getattr(config.inference.deployment, "backend_port", 8100) if config.inference else 8100,
             inference_tp=config.inference.parallel.tp if config.inference else 1,
             inference_enable_expert_parallel=config.inference.enable_expert_parallel if config.inference else False,
             inference_data_parallel_rpc_port=config.inference.data_parallel_rpc_port if config.inference else 29600,
-            dp_per_node=(config.deployment.gpus_per_node // config.inference.parallel.tp) if config.inference else 1,
+            dp_per_node=(deployment.gpus_per_node // config.inference.parallel.tp) if config.inference else 1,
             use_nccl_broadcast=config.weight_broadcast is not None and config.weight_broadcast.type == "nccl",
             wandb_shared=config.wandb is not None and config.wandb.shared,
             ranks_filter=",".join(map(str, config.trainer.log.ranks_filter)),
@@ -480,6 +587,7 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
 
 def rl_slurm(config: RLConfig):
     assert config.slurm is not None
+    deployment = cast(Any, config.deployment)
 
     logger = setup_logger(
         config.log.level or os.environ.get("PRIME_LOG_LEVEL", "info"), json_logging=config.log.json_logging
@@ -488,7 +596,7 @@ def rl_slurm(config: RLConfig):
     config_dir = config.output_dir / "configs"
     log_dir = get_log_dir(config.output_dir)
 
-    if config.deployment.type == "single_node":
+    if deployment.type == "single_node":
         write_config(config, config_dir, exclude={"slurm", "dry_run", "clean_output_dir"})
         logger.info(f"Wrote config to {config_dir / RL_TOML}")
 
@@ -510,7 +618,7 @@ def rl_slurm(config: RLConfig):
         train_env_names = [env.resolved_name for env in config.orchestrator.train.env]
         eval_env_names = [env.resolved_name for env in config.orchestrator.eval.env] if config.orchestrator.eval else []
 
-        has_infer = config.deployment.num_infer_nodes > 0
+        has_infer = deployment.num_infer_nodes > 0
         log_message = format_log_message(
             log_dir=log_dir,
             trainer=True,
@@ -518,8 +626,8 @@ def rl_slurm(config: RLConfig):
             inference=has_infer,
             train_env_names=train_env_names,
             eval_env_names=eval_env_names,
-            num_train_nodes=config.deployment.num_train_nodes,
-            num_infer_nodes=config.deployment.total_infer_nodes if has_infer else 0,
+            num_train_nodes=deployment.num_train_nodes,
+            num_infer_nodes=deployment.total_infer_nodes if has_infer else 0,
         )
 
     script_path = config.output_dir / RL_SBATCH

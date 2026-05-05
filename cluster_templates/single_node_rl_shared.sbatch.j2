@@ -1,0 +1,73 @@
+#!/bin/bash
+
+#SBATCH --job-name={{ job_name }}
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:{{ gpus_per_node }}
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=256G
+#SBATCH --qos=high
+#SBATCH --partition={{ partition }}
+{%- if account %}
+#SBATCH --account={{ account }}
+{%- endif %}
+{%- if time %}
+#SBATCH --time={{ time }}
+{%- endif %}
+{%- if nodelist %}
+#SBATCH --nodelist={{ nodelist }}
+{%- endif %}
+{%- if exclude %}
+#SBATCH --exclude={{ exclude }}
+{%- endif %}
+#SBATCH --output={{ output_dir }}/job_%j.log
+#SBATCH --error={{ output_dir }}/job_%j.log
+
+set -euo pipefail
+
+export PROJECT_DIR={{ project_dir }}
+export UV_LINK_MODE=copy
+export PRIME_DISABLE_VERSION_CHECK=1
+export PYTHONUNBUFFERED=1
+export TRITON_CACHE_DIR=/tmp/triton-cache-$USER-$SLURM_JOB_ID
+
+cd "$PROJECT_DIR"
+[ -f /workspace-vast/adamk/activation_oracles_dev/.env ] && source /workspace-vast/adamk/activation_oracles_dev/.env
+[ -f .env ] && source .env
+source .venv/bin/activate
+
+echo "SLURM_JOB_ID=${SLURM_JOB_ID}"
+echo "SLURM_JOB_NODELIST=${SLURM_JOB_NODELIST}"
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
+nvidia-smi
+
+mkdir -p {{ output_dir }}/logs
+GPU_UTIL_LOG={{ output_dir }}/logs/gpu_util_${SLURM_JOB_ID}.csv
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    nvidia-smi -i "${CUDA_VISIBLE_DEVICES}" \
+        --query-gpu=timestamp,index,name,utilization.gpu,memory.used,memory.total,power.draw \
+        --format=csv -l 15 > "$GPU_UTIL_LOG" &
+else
+    nvidia-smi \
+        --query-gpu=timestamp,index,name,utilization.gpu,memory.used,memory.total,power.draw \
+        --format=csv -l 15 > "$GPU_UTIL_LOG" &
+fi
+GPU_MONITOR_PID=$!
+trap 'kill "$GPU_MONITOR_PID" 2>/dev/null || true' EXIT
+echo "GPU utilization log: $GPU_UTIL_LOG"
+
+.venv/bin/python - <<'PY'
+import importlib.util
+for name in ["prime_rl", "verifiers"]:
+    assert importlib.util.find_spec(name) is not None, name
+optional_envs = ["reverse_text", "model_understanding_rl"]
+available_envs = [name for name in optional_envs if importlib.util.find_spec(name) is not None]
+print(f"Prime RL imports ok; installed local envs: {available_envs}")
+PY
+
+{% if pre_run_command %}
+# Pre-run command
+{{ pre_run_command }}
+{% endif %}
+
+.venv/bin/rl @ {{ config_path }}
