@@ -39,7 +39,7 @@ Useful pointers:
   - One-off PrimeRL integration scripts and benchmark outputs.
   - Contains dataset export, SFT adapter merge, and judge latency benchmark code.
 
-- `/workspace-vast/adamk/activation_oracles_dev/investigations/model_understanding_prime_rl/results/prime_mu_sft_dataset/`
+- `/workspace-vast/adamk/activation_oracles_dev/investigations/model_understanding_prime_rl/results/prime_mu_investigation_only_dataset/`
   - Exported train/eval JSONL files consumed by this PrimeRL environment.
 
 This PrimeRL fork should be read as the RL execution wrapper around those
@@ -82,9 +82,9 @@ pipeline code.
 The configs point at the exported PrimeRL-format dataset:
 
 ```text
-/workspace-vast/adamk/activation_oracles_dev/investigations/model_understanding_prime_rl/results/prime_mu_sft_dataset/train.jsonl
-/workspace-vast/adamk/activation_oracles_dev/investigations/model_understanding_prime_rl/results/prime_mu_sft_dataset/eval.jsonl
-/workspace-vast/adamk/activation_oracles_dev/investigations/model_understanding_prime_rl/results/prime_mu_sft_dataset/metadata.json
+/workspace-vast/adamk/activation_oracles_dev/investigations/model_understanding_prime_rl/results/prime_mu_investigation_only_dataset/train.jsonl
+/workspace-vast/adamk/activation_oracles_dev/investigations/model_understanding_prime_rl/results/prime_mu_investigation_only_dataset/eval.jsonl
+/workspace-vast/adamk/activation_oracles_dev/investigations/model_understanding_prime_rl/results/prime_mu_investigation_only_dataset/metadata.json
 ```
 
 The export/prep scripts live in the activation-oracles repo:
@@ -97,6 +97,32 @@ The export/prep scripts live in the activation-oracles repo:
 
 The environment expects each dataset row to contain the conversation prompt,
 question, and reference answer. It fails loudly if required fields are missing.
+
+The current dataset is investigation-only:
+
+```text
+num_train_examples: 22011
+num_eval_examples: 0
+synthetic_data_paths: null
+```
+
+It is exported from `qwen3_8b_50k_train/investigations.json` joined with
+`screening.json` and `verification.json`. It deliberately excludes
+`synthetic_data.json`; an earlier PrimeRL export accidentally inherited the SFT
+config's synthetic data path and produced a mixed dataset with 109,965 examples.
+
+The export command used for the investigation-only dataset was:
+
+```bash
+cd /workspace-vast/adamk/activation_oracles_dev
+.venv/bin/python investigations/model_understanding_prime_rl/export_prime_dataset.py \
+  --sft-config checkpoints_text_sft/mu_qwen3_8b_50k_s7_synth_e1_kl1/final/training_config.json \
+  --run-dir data_pipelines/model_understanding/runs/qwen3_8b_50k_train \
+  --exclude-synthetic \
+  --output-dir investigations/model_understanding_prime_rl/results/prime_mu_investigation_only_dataset \
+  --train-filename train.jsonl \
+  --eval-filename eval.jsonl
+```
 
 ## Reward/Judge
 
@@ -114,6 +140,9 @@ correctness 3 -> reward 0.50
 correctness 4 -> reward 0.75
 correctness 5 -> reward 1.00
 ```
+
+Raw judge `specificity` and `correctness` are also logged as zero-weight
+PrimeRL metrics during training. They do not affect reward or advantage.
 
 The main judge model used so far:
 
@@ -255,7 +284,12 @@ that failure mode.
 
 ## Trained Runs So Far
 
-### 2-GPU forced-tool run
+Important: the completed runs below used the earlier mixed dataset export,
+which included synthetic counterfactual examples. They are useful systems tests
+for the launcher, transcript logging, and judge throughput, but should not be
+treated as the intended investigation-only RL runs.
+
+### Superseded 2-GPU forced-tool run
 
 ```text
 W&B name: mu-qwen3-8b-rl-2gpu-forced-tool-noseed-v2
@@ -276,7 +310,7 @@ Transcript sanity checks passed:
 - Repeated prompt groups had 16 unique responses after removing the sampling
   seed.
 
-### 3-GPU thinking-judge run
+### Superseded 3-GPU thinking-judge run
 
 ```text
 W&B name: mu-qwen3-8b-rl-3gpu-thinking-split

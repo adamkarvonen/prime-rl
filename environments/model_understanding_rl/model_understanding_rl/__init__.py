@@ -367,6 +367,7 @@ def load_environment(
                 response_text=response_text,
             )
             reward = (result.correctness - 1) / 4
+            state["model_understanding_judge"] = result
             judge_user_message = JUDGE_USER_TEMPLATE.format(
                 question_text=question_text,
                 reference_answer=answer,
@@ -417,5 +418,15 @@ def load_environment(
             )
         )
 
-    rubric = vf.Rubric(funcs=[correctness_reward_func], weights=[1.0], parser=parser)
+    def specificity_metric(states) -> list[float]:
+        return [float(state["model_understanding_judge"].specificity) for state in states]
+
+    def correctness_metric(states) -> list[float]:
+        return [float(state["model_understanding_judge"].correctness) for state in states]
+
+    rubric = vf.Rubric(
+        funcs=[correctness_reward_func, specificity_metric, correctness_metric],
+        weights=[1.0, 0.0, 0.0],
+        parser=parser,
+    )
     return vf.SingleTurnEnv(dataset=dataset, parser=parser, rubric=rubric, **kwargs)
