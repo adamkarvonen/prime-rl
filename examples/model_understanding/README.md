@@ -472,3 +472,10 @@ Possible next experiments:
   prompt.
 - Do not commit `outputs/`, checkpoints, merged model weights, or transcripts.
 - Treat local paths in these configs as cluster-local paths, not portable defaults.
+
+### Output directory naming
+
+**When changing hyperparameters, always change `output_dir` and the W&B `name`.**
+If two runs share the same `output_dir`, `clean_output_dir = true` will
+permanently delete the previous run's checkpoints, weights, and transcripts.
+Encode key hyperparameters (at minimum the LR) in the output dir name.

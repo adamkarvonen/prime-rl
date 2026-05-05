@@ -60,7 +60,7 @@ echo "GPU utilization log: $GPU_UTIL_LOG"
 import importlib.util
 for name in ["prime_rl", "verifiers"]:
     assert importlib.util.find_spec(name) is not None, name
-optional_envs = ["reverse_text", "model_understanding_rl"]
+optional_envs = ["reverse_text", "model_understanding_rl", "model_understanding_rl_v2"]
 available_envs = [name for name in optional_envs if importlib.util.find_spec(name) is not None]
 print(f"Prime RL imports ok; installed local envs: {available_envs}")
 PY

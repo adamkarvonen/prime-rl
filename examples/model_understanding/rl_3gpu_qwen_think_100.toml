@@ -1,4 +1,4 @@
-output_dir = "outputs/mu-rl-no-think-lr5e-6"
+output_dir = "outputs/mu-rl-think-lr5e-6"
 clean_output_dir = false
 max_steps = 1000
 seq_len = 4096
@@ -14,7 +14,7 @@ name = "/workspace-vast/adamk/prime-rl/outputs/mu_qwen3_8b_50k_s7_synth_e1_kl1_m
 
 [wandb]
 project = "model-understanding-rl"
-name = "mu-rl-no-think-lr5e-6"
+name = "mu-rl-think-lr5e-6"
 offline = false
 shared = true
 
@@ -35,12 +35,12 @@ max_retries = 0
 
 [orchestrator.train.sampling]
 temperature = 1.0
-max_completion_tokens = 512
+max_completion_tokens = 2048
 
 [[orchestrator.train.env]]
 id = "model-understanding-rl"
 name = "model_understanding"
-args = { dataset_path = "/workspace-vast/adamk/activation_oracles_dev/investigations/model_understanding_prime_rl/results/prime_mu_investigation_only_dataset/train.jsonl", dataset_split = "train", tokenizer_name = "/workspace-vast/adamk/prime-rl/outputs/mu_qwen3_8b_50k_s7_synth_e1_kl1_merged", tokenizer_trust_remote_code = false, chat_template_kwargs = { enable_thinking = false }, judge_model = "claude-haiku-4-5-20251001", judge_concurrency = 80, judge_thinking_budget = 1024, judge_max_tokens = 1400, judge_mode = "thinking_json", transcript_dir = "/workspace-vast/adamk/prime-rl/transcripts/no-thinking" }
+args = { dataset_path = "/workspace-vast/adamk/activation_oracles_dev/investigations/model_understanding_prime_rl/results/prime_mu_investigation_only_dataset/train.jsonl", dataset_split = "train", tokenizer_name = "/workspace-vast/adamk/prime-rl/outputs/mu_qwen3_8b_50k_s7_synth_e1_kl1_merged", tokenizer_trust_remote_code = false, chat_template_kwargs = { enable_thinking = true }, judge_model = "claude-haiku-4-5-20251001", judge_concurrency = 80, judge_thinking_budget = 1024, judge_max_tokens = 1400, judge_mode = "thinking_json", strip_thinking = true, transcript_dir = "/workspace-vast/adamk/prime-rl/transcripts/reasoning" }
 timeout = 300
 
 [orchestrator.client]
@@ -74,11 +74,12 @@ max_model_len = 5000
 enforce_eager = false
 
 [inference.vllm_extra.default_chat_template_kwargs]
-enable_thinking = false
+enable_thinking = true
 
 [slurm]
-job_name = "prime-mu-3g-th-inv"
+job_name = "prime-mu-3g-qt-inv"
 project_dir = "/workspace-vast/adamk/prime-rl"
 template_path = "/workspace-vast/adamk/prime-rl/cluster_templates/single_node_rl_shared.sbatch.j2"
 partition = "general"
 time = "12:00:00"
+exclude = "node-25"

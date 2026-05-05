@@ -695,6 +695,7 @@ async def orchestrate(config: OrchestratorConfig):
             "reward/all/mean": by_example.reward.mean().mean(),
             "reward/all/max": by_example.reward.mean().max(),
             "reward/all/min": by_example.reward.mean().min(),
+            "reward/all/std": by_example.reward.std().mean(),
             # Solve / batch metrics
             "solve_none/all": solve_none,
             "solve_all/all": solve_all,
@@ -745,6 +746,7 @@ async def orchestrate(config: OrchestratorConfig):
             to_log[f"reward/{env}/mean"] = env_by_example.reward.mean().mean()
             to_log[f"reward/{env}/max"] = env_by_example.reward.mean().max()
             to_log[f"reward/{env}/min"] = env_by_example.reward.mean().min()
+            to_log[f"reward/{env}/std"] = env_by_example.reward.std().mean()
             solve_none, solve_all, effective_batch_size = compute_solve_rates(env_df)
             to_log[f"solve_none/{env}"] = solve_none
             to_log[f"solve_all/{env}"] = solve_all
