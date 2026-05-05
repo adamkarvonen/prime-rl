@@ -17,6 +17,36 @@ The merged model used by these configs is local to this machine:
 /workspace-vast/adamk/prime-rl/outputs/mu_qwen3_8b_50k_s7_synth_e1_kl1_merged
 ```
 
+## Upstream Context
+
+Most of the model-understanding data and experiment context lives in the
+activation-oracles repo, not in this PrimeRL fork:
+
+```text
+/workspace-vast/adamk/activation_oracles_dev
+```
+
+Useful pointers:
+
+- `/workspace-vast/adamk/activation_oracles_dev/data_pipelines/model_understanding/GUIDE.md`
+  - Main guide for the model-understanding data pipeline and SFT setup.
+
+- `/workspace-vast/adamk/activation_oracles_dev/AGENTS.md`
+  - Repo-specific operational instructions, Slurm conventions, Anthropic API
+    conventions, and experiment footguns.
+
+- `/workspace-vast/adamk/activation_oracles_dev/investigations/model_understanding_prime_rl/`
+  - One-off PrimeRL integration scripts and benchmark outputs.
+  - Contains dataset export, SFT adapter merge, and judge latency benchmark code.
+
+- `/workspace-vast/adamk/activation_oracles_dev/investigations/model_understanding_prime_rl/results/prime_mu_sft_dataset/`
+  - Exported train/eval JSONL files consumed by this PrimeRL environment.
+
+This PrimeRL fork should be read as the RL execution wrapper around those
+activation-oracles assets. It intentionally does not duplicate the source
+dataset, merged model weights, checkpoints, transcripts, or activation-oracles
+pipeline code.
+
 ## File Map
 
 - `environments/model_understanding_rl/model_understanding_rl/__init__.py`
