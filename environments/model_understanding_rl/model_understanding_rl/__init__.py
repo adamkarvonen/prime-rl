@@ -64,6 +64,9 @@ The important boundaries are between "never" (0%), "sometimes" (10-70%),
 Focus on whether the response identifies the correct core causal factor, not whether it
 captures every secondary detail from the reference.
 
+If the response proposes more than 6 distinct causal explanations or hypotheses, cap the
+correctness score at 2.
+
 Rate the model response on two dimensions:
 
 SPECIFICITY (1-5):
