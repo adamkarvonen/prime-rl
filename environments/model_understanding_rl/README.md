@@ -158,6 +158,29 @@ reasoning.
 
 - Source the activation-oracles `.env` before local runs that call Anthropic, or
   use the Slurm template that sources it for you.
+- **Do not use the LoRA warm-start converter for trusted runs yet.** The
+  converted-checkpoint path is still in development and has produced invalid
+  resume behavior in May 7 testing. Use it only for debugging until the
+  optimizer/scheduler/per-run LR state is deliberately handled and revalidated.
+- To warm-start RL from an SFT LoRA adapter, keep the RL model set to the base
+  model, set `trainer.max_concurrent_runs > 1`, set both checkpoint
+  `resume_step` values to `0`, then convert the adapter into a PrimeRL
+  multi-run checkpoint before launch:
+
+  ```bash
+  /home/adamk/.local/bin/uv run python -m prime_rl.tools.lora_to_rl_checkpoint \
+    --adapter-dir /workspace-vast/adamk/activation_oracles_dev/checkpoints_text_sft/mu_qwen3_8b_50k_s7_synth_e1_kl1/final \
+    --rl-config examples/model_understanding/rl_3gpu_thinking_lora_warmstart.toml \
+    --output-dir outputs/mu-rl-lora-warmstart-no-think-lr5e-6 \
+    --run-id run_default \
+    --step 0 \
+    --trainer-rank-count 1
+  ```
+
+  The converter validates the adapter config against the RL trainer LoRA config
+  and writes `run_default/checkpoints/step_0/{trainer,orchestrator,weight}` so
+  the multi-run manager can resume from the adapter without trainer-side
+  warm-start logic.
 - Keep judge API calls asynchronous with a concurrency semaphore.
 - Do not set a fixed rollout sampling seed for real RL runs with multiple
   rollouts per prompt; that made repeated rollouts nearly identical.

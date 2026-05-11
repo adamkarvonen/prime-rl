@@ -5,13 +5,15 @@ explanations. The task is: given a prior conversation and a question about the
 model's behavior, train the rollout model to produce an explanation that matches
 a reference answer. Rewards come from an Anthropic LLM judge.
 
-The current target model is a Qwen3-8B SFT checkpoint merged from:
+The older configs target a Qwen3-8B SFT checkpoint merged from:
 
 ```text
 checkpoints_text_sft/mu_qwen3_8b_50k_s7_synth_e1_kl1
 ```
 
-The merged model used by these configs is local to this machine:
+The LoRA warm-start config below instead uses `Qwen/Qwen3-8B` plus the saved
+SFT adapter directly. The merged model used by the older configs is local to
+this machine:
 
 ```text
 /workspace-vast/adamk/prime-rl/outputs/mu_qwen3_8b_50k_s7_synth_e1_kl1_merged
@@ -155,14 +157,22 @@ Two judge modes are implemented:
 - `thinking_json`
   - Anthropic thinking enabled.
   - The judge returns JSON text.
-  - Current 3-GPU run used `judge_thinking_budget = 1024` and
-    `judge_max_tokens = 1400`.
+  - `judge_thinking_budget = 1024`, `judge_max_tokens = 1400`.
+  - ~10.6s mean latency per call.
+  - Better for offline evals and spot checks where judge reasoning is useful.
 
-- `forced_tool`
-  - Uses a tool schema to force structured output.
-  - Used as a faster/no-thinking ablation.
-  - This was useful experimentally, but the preferred current mode is
-    `thinking_json` because we want judge reasoning enabled.
+- `forced_tool` (recommended for online RL)
+  - Uses a forced tool schema with required `reasoning`, `specificity`, and
+    `correctness` fields.
+  - No Anthropic thinking.
+  - ~3.4s mean latency per call (~3x faster).
+  - `judge_max_tokens = 600`.
+  - Slightly lower correctness scores on average (~0.06-0.08 points), so treat
+    as a slightly different reward definition. Do not switch judge modes mid-run.
+
+The judge prompt also includes a hypothesis cap: if the response proposes more
+than 6 distinct causal explanations, correctness is capped at 2. This prevents
+reward hacking via shotgun-style responses that list many hypotheses.
 
 The environment saves the exact judge system prompt and user message in every
 transcript row.
@@ -188,70 +198,68 @@ This is meant to support manual review without rerunning inference.
 
 ## Run Configs
 
-### Recommended short run: 3-GPU thinking judge
+### Canonical: 4-GPU no-think, forced-tool judge, bs256
 
 ```text
-examples/model_understanding/rl_3gpu_thinking_100.toml
+examples/model_understanding/rl_4gpu_nothink_bs256_forced_tool_canonical.toml
 ```
 
-This is the current best smoke/trial configuration:
+This is the current recommended configuration:
 
-- 3 GPUs total.
-- 2 independent one-GPU vLLM inference replicas.
-- 1 trainer GPU.
-- Haiku judge with thinking enabled.
-- `batch_size = 32`.
-- `rollouts_per_example = 16`.
-- `max_inflight_rollouts = 80`.
-- `temperature = 1.0`.
-- `max_completion_tokens = 512`.
-- LoRA rank 64, alpha 128, dropout 0.05.
-- `max_model_len = 5000`.
-- `gpu_memory_utilization = 0.90`.
-- 100 RL steps.
-
-Run a dry run:
+- 4 GPUs total: 2 inference + 2 training.
+- `batch_size = 256`, `rollouts_per_example = 16` (16 prompts per batch).
+- Haiku judge with `forced_tool` mode (no thinking, ~3x faster than
+  `thinking_json`).
+- `judge_max_tokens = 600`.
+- `max_completion_tokens = 512`, `enable_thinking = false`.
+- LoRA rank 64, alpha 128, dropout 0.05, LR 5e-6.
+- `max_model_len = 5000`, `gpu_memory_utilization = 0.90`.
+- Checkpoint every 100 steps.
+- `skip_gather_master_weights = true`, `weights_only = false`. This saves
+  distributed trainer checkpoints (LoRA weights + optimizer state + scheduler +
+  progress) for resumability, but skips gathering and saving the full merged
+  model weights, which would be tens of GB per checkpoint. The LoRA + optimizer
+  checkpoint is ~3 GB for 32B and ~1 GB for 8B. To export HF-compatible
+  weights for inference, merge the LoRA adapter after training (see "Combining
+  SFT + RL LoRAs" below). **Do not set both `skip_gather_master_weights = true`
+  and `weights_only = true`** — that combination silently disables all trainer
+  checkpoint saves, leaving only orchestrator progress (no model weights or
+  optimizer state).
+- All rollout filters set to `enforce = false` (monitor only).
+- Judge prompt includes a hypothesis cap: responses with more than 6 distinct
+  causal hypotheses are capped at correctness 2.
+- 1000 RL steps.
 
 ```bash
 cd /workspace-vast/adamk/prime-rl
-.venv/bin/rl @ examples/model_understanding/rl_3gpu_thinking_100.toml --dry-run
+source /workspace-vast/adamk/activation_oracles_dev/.env
+.venv/bin/rl @ examples/model_understanding/rl_4gpu_nothink_bs256_forced_tool_canonical.toml
 ```
 
-Submit to Slurm:
-
-```bash
-cd /workspace-vast/adamk/prime-rl
-.venv/bin/rl @ examples/model_understanding/rl_3gpu_thinking_100.toml
-```
-
-### 2-GPU forced-tool ablation
+### Canonical: 3-GPU think, thinking judge
 
 ```text
-examples/model_understanding/rl_2gpu_forced_tool_100.toml
+examples/model_understanding/rl_3gpu_judge_think_qwen_think_canonical.toml
 ```
 
-This uses:
+This is the thinking variant from the May 5 successful 1000-step run:
 
-- 1 inference GPU.
-- 1 trainer GPU.
-- Forced-tool judge output.
-- No judge thinking.
-- 100 RL steps.
+- 3 GPUs total: 2 inference + 1 training.
+- `batch_size = 32`, `rollouts_per_example = 16` (2 prompts per batch).
+- `enable_thinking = true`, `strip_thinking = true`.
+- `thinking_json` judge mode.
+- `max_completion_tokens = 2048`.
 
-This completed successfully, but it is not the preferred current judge setup.
+Note: the small batch size (2 prompts) makes this config fragile with the
+`zero_advantage` filter enforced. The May 5 run survived by luck (hit 32/32
+all-filtered 5 times but never 3 consecutive). Consider increasing batch_size
+or disabling zero_advantage enforcement for new runs.
 
-### Older/diagnostic configs
+### Archived configs
 
-```text
-examples/model_understanding/rl_2gpu.toml
-examples/model_understanding/rl_2gpu_smoke.toml
-examples/model_understanding/rl_2gpu_profile.toml
-```
-
-These are useful as references and for quick debugging, but note that some of
-these still set a sampling seed. A fixed sampling seed caused repeated rollouts
-for the same prompt to be nearly identical. Prefer the no-seed configs for real
-training runs.
+Older and experimental configs are in `examples/model_understanding/archive/`.
+These include 2-GPU, profiling, LoRA warm-start, opus batch judge, and mixed
+data experiment configs.
 
 ## Slurm Notes
 
@@ -271,6 +279,11 @@ Important details:
 - PrimeRL's launcher sets `CUDA_VISIBLE_DEVICES` only for child inference/trainer
   processes inside the Slurm allocation.
 - Logs `nvidia-smi` and periodic GPU utilization.
+
+**Always use a 3-day time limit** (`time = "3-00:00:00"`). RL runs should never
+die because of a Slurm timeout — the job should run until `max_steps` completes
+or a real error occurs. A 12-hour limit is not enough for 1000-step runs,
+especially with 32B models or large batch sizes.
 
 Before submitting, check existing jobs/GPU usage:
 
@@ -398,6 +411,133 @@ Other selection modes:
 
 The script intentionally prints full text, not abbreviated snippets.
 
+## Combining SFT + RL LoRAs
+
+Prime RL requires the warm-start model to be a normal HF model path, so the SFT
+LoRA was merged into the base before RL training. The result is two stacked
+adapters: the SFT LoRA inside the merged model, and the RL LoRA on top. To serve
+the final model with the original `Qwen/Qwen3-8B` base via vLLM, the two LoRAs
+need to be concatenated into a single adapter.
+
+### Scripts
+
+The combination and verification scripts live in the activation-oracles repo:
+
+```text
+/workspace-vast/adamk/activation_oracles_dev/investigations/model_understanding_prime_rl/combine_lora_adapters.py
+/workspace-vast/adamk/activation_oracles_dev/investigations/model_understanding_prime_rl/verify_combined_lora.py
+```
+
+Run them with the activation-oracles `.venv`. They have no Slurm dependencies
+and run in a few seconds (combine) to a few minutes (verify, since it loads
+model shards).
+
+### Combine step
+
+For each target module, the combine script concatenates the rank-64 SFT LoRA
+with the rank-64 RL LoRA into a single rank-128 LoRA. The math is exact: A
+matrices stack along dim 0, B matrices stack along dim 1, and the combined
+adapter uses `alpha=256, r=128` to preserve the original `alpha/r=2.0` scaling.
+
+```bash
+cd /workspace-vast/adamk/activation_oracles_dev
+.venv/bin/python investigations/model_understanding_prime_rl/combine_lora_adapters.py \
+  --sft-adapter checkpoints_text_sft/mu_qwen3_8b_50k_s7_synth_e1_kl1/final \
+  --rl-adapter /workspace-vast/adamk/prime-rl/outputs/<RL_RUN_DIR>/weights/step_<N>/lora_adapters \
+  --output-dir checkpoints_text_sft/<OUTPUT_NAME>_combined \
+  --base-model Qwen/Qwen3-8B \
+  --from-sft-weights
+```
+
+`--from-sft-weights` uses the raw stored SFT LoRA weights (fast, simple). Omit
+the flag and pass `--merged-model-dir <path>` to instead extract the SFT delta
+from the actual merged model via SVD. Both approaches produce adapters of
+equivalent accuracy in practice.
+
+The output directory contains:
+
+- `adapter_model.safetensors` — combined LoRA weights (bfloat16, ~667MB)
+- `adapter_config.json` — `r=128, alpha=256, base_model_name_or_path=Qwen/Qwen3-8B`
+- Tokenizer files copied from the SFT adapter
+- `combine_metadata.json` — pointers to source adapters and config
+
+### Verification
+
+There are two verification levels.
+
+**Weight-level (CPU, definitive)**: directly compares the effective merged
+weights of both setups for every target module. Differences come only from
+bfloat16 storage of LoRA factors. Expected max abs diff: ~2.5e-3, max rel diff:
+~3e-3.
+
+```bash
+cd /workspace-vast/adamk/activation_oracles_dev
+.venv/bin/python investigations/model_understanding_prime_rl/verify_combined_lora.py \
+  --base-model-dir <HF_CACHE_PATH_TO_Qwen3-8B> \
+  --merged-model-dir /workspace-vast/adamk/prime-rl/outputs/mu_qwen3_8b_50k_s7_synth_e1_kl1_merged \
+  --rl-adapter /workspace-vast/adamk/prime-rl/outputs/<RL_RUN_DIR>/weights/step_<N>/lora_adapters \
+  --combined-adapter checkpoints_text_sft/<OUTPUT_NAME>_combined \
+  --output checkpoints_text_sft/<OUTPUT_NAME>_combined/verify_results.json
+```
+
+**Forward-pass logprob diffs (Slurm GPU, qualitative)**: optional. Loads both
+configs in vLLM and compares per-token prompt logprobs across a sample of
+training prompts. Submit via Slurm:
+
+```bash
+sbatch <PATH_TO>/kl_check.sbatch  # template at outputs/<combined>/kl_check.sbatch
+```
+
+The kl-check sbatch template runs:
+
+```text
+investigations/model_understanding_prime_rl/kl_check_combined_lora.py
+```
+
+with `--n-prompts 100` against the investigation-only training set.
+
+### Expected accuracy
+
+On 100 training prompts (~25k token positions):
+
+```text
+Per-token logprob |Δ|:  median 0.018, mean 0.056, p95 0.18, p99 0.37
+                        max 25 (a few extreme single-token outliers per run)
+Per-prompt mean Δ:      median 0.05, max 0.17
+```
+
+This is larger than pure bf16 noise because the combined LoRA applies the SFT
+delta as a factored low-rank computation (`B @ (A @ x)`) instead of a
+pre-merged full-rank matmul. The 0.3% per-module weight diff compounds across
+36 residual layers. For generation it's qualitatively fine; for exact logprob
+evaluation expect noticeable shifts on a small fraction of tokens.
+
+### Using with vLLM
+
+Point vLLM at `Qwen/Qwen3-8B` as the base, enable LoRA with `max_lora_rank=128`,
+and load the combined adapter as the LoRA request:
+
+```python
+from vllm import LLM, SamplingParams
+from vllm.lora.request import LoRARequest
+
+llm = LLM(model="Qwen/Qwen3-8B", enable_lora=True, max_lora_rank=128, dtype="bfloat16")
+adapter = LoRARequest("mu", 1, "/path/to/<OUTPUT_NAME>_combined")
+out = llm.generate(prompts, SamplingParams(...), lora_request=adapter)
+```
+
+### Currently exported adapters
+
+```text
+/workspace-vast/adamk/activation_oracles_dev/checkpoints_text_sft/mu_qwen3_8b_sft_rl_think_5e6_step1000_combined
+/workspace-vast/adamk/activation_oracles_dev/checkpoints_text_sft/mu_qwen3_8b_sft_rl_no_think_5e6_step1000_combined
+```
+
+These are the combined SFT + RL LoRAs from the 5e-6 runs at the final step
+(1000), one for the thinking-judge variant and one for the no-think variant
+(`outputs/mu-rl-no-think-lr5e-6`). Replace `<RL_RUN_DIR>` and `<N>` in the
+commands above to combine other RL checkpoints.
+
 ## Launcher Patch
 
 The only PrimeRL internal change is in:
@@ -443,29 +583,63 @@ patch is not needed.
 
 ## Current Read On Efficiency
 
-In the 3-GPU thinking run, the system was mostly trainer-bound after startup.
-Rollout generation and judging often completed quickly, and the orchestrator
-waited for trainer checkpoints. That suggests adding more inference GPUs is not
-obviously useful at this batch/sequence length unless trainer throughput changes.
+With `batch_size = 256` and `forced_tool` judge mode on 4 GPUs (2 train + 2
+infer), the orchestrator and trainer are roughly balanced at ~50-90s per step.
+The judge API calls (~3.4s each, concurrency 80) and vLLM rollout generation
+share the orchestrator step time. The trainer processes ~128 micro-batches per
+step via gradient accumulation.
 
-The trainer GPU showed useful bursts but modest MFU, generally around the
-mid-20% range after warmup. The inference GPUs were bursty and mostly idle
-between rollout waves.
+Key batch size finding (May 7): `batch_size` in prime-rl is the total number
+of rollouts per step, not the number of prompts. With `rollouts_per_example =
+16`, the number of unique prompts per batch is `batch_size / 16`. The original
+bs=32 configs had only 2 prompts per batch, which made the zero-advantage
+filter statistically fragile. The canonical bs=256 config has 16 prompts per
+batch.
 
-Possible next experiments:
-
-- Run a fixed held-out eval on the SFT baseline and RL checkpoint.
-- Try longer runs only after held-out eval plumbing is in place.
-- Try higher trainer batch/effective batch if memory and PrimeRL config allow it.
-- Compare `thinking_json` versus faster structured no-thinking judging on a fixed
-  sample before choosing a long-run reward path.
-- Consider a 2-GPU thinking run if the trainer remains the bottleneck.
+Startup takes ~25-30 min on a fresh node (uv resolution, model loading, CUDA
+graph capture). See `may_7_findings.markdown` for a detailed breakdown and
+optimization ideas.
 
 ## Operational Caveats
 
 - Use the local `.venv`.
-- Source `/workspace-vast/adamk/activation_oracles_dev/.env` or rely on the
-  Slurm template sourcing it.
+- **Source `.env` before running the `rl` CLI locally.** The `rl` command
+  pre-downloads the trainer model before submitting to Slurm. Without
+  `HF_HOME=/workspace-vast/pretrained_ckpts` (set in the `.env`), it defaults to
+  `~/.cache/huggingface/`, which is on `/home/` — not accessible from Slurm nodes
+  and not where the cluster's shared model cache lives. Either source the
+  activation-oracles `.env` or export `HF_HOME` manually:
+  ```bash
+  source /workspace-vast/adamk/activation_oracles_dev/.env
+  # or: export HF_HOME=/workspace-vast/pretrained_ckpts
+  ```
+  The Slurm template already sources this `.env`, so jobs run correctly once
+  submitted — the issue is only with the local `rl` CLI pre-download step.
+- **Submission: prefer `uv run rl` (one command).** Both `uv run rl` and the
+  `--dry-run` + `sbatch` two-step path spend ~9 minutes in `uv` dependency
+  resolution, which dominates submission time. The dry-run only skips
+  `pre_download_model()`, which is fast for local model paths. Use the
+  dry-run path when you need to edit the generated sbatch before submitting,
+  or for rapid resubmission of the same config (just `sbatch outputs/.../rl.sbatch`
+  again, skipping `uv` resolve entirely).
+  ```bash
+  # Default (one command):
+  source /workspace-vast/adamk/activation_oracles_dev/.env
+  uv run rl @ examples/model_understanding/<config>.toml
+
+  # Fast resubmit (skip uv resolve):
+  sbatch --qos=high outputs/<output_dir>/rl.sbatch
+  ```
+  **Caveat:** `--dry-run` is not read-only. The launcher still validates the
+  output directory, writes resolved configs and `rl.sbatch`, and cleans stale
+  rollout/broadcast step directories for fresh runs. Use it for fresh output
+  directories, not against an active or valuable existing run directory.
+- **Always set `skip_model_check = true`** in `[orchestrator.client]`. Without
+  this, the orchestrator queries `/v1/models` immediately after the vLLM API
+  server starts, but there's a race condition where the model isn't registered
+  yet. This has killed multiple runs. The check has low value for local model
+  paths — if the path is wrong, the first rollout request will fail with a
+  clear error anyway. See `may_7_findings.markdown` for details.
 - Keep `gpu_memory_utilization = 0.90`.
 - Keep `max_model_len` explicit.
 - Do not set a rollout sampling seed for real RL runs with multiple rollouts per
