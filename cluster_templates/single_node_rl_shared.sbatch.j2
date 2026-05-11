@@ -24,6 +24,7 @@
 #SBATCH --error={{ output_dir }}/job_%j.log
 
 set -euo pipefail
+source /workspace-vast/adamk/activation_oracles_dev/scripts/gpu_preflight.sh
 
 export PROJECT_DIR={{ project_dir }}
 export UV_LINK_MODE=copy
