@@ -7,11 +7,13 @@ each saving to its own run directory.
 import shutil
 from dataclasses import asdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, overload
 
 import torch
 import torch.distributed as dist
+from torch import Tensor
 from torch.distributed.checkpoint.stateful import Stateful
+from torch.distributed.tensor import DTensor, distribute_tensor
 
 from prime_rl.configs.trainer import CheckpointConfig
 from prime_rl.trainer.ckpt import CheckpointManager
@@ -23,6 +25,36 @@ from prime_rl.utils.pathing import get_stable_ckpt_steps
 if TYPE_CHECKING:
     from prime_rl.trainer.optim import MultiLoRAOptimizer
     from prime_rl.trainer.scheduler import MultiLoRAScheduler
+
+
+def _copy_checkpoint_tensor(target: Tensor | DTensor, value: Tensor | DTensor) -> None:
+    assert tuple(target.shape) == tuple(value.shape), (
+        f"Checkpoint tensor shape mismatch: target {tuple(target.shape)} vs checkpoint {tuple(value.shape)}"
+    )
+
+    if isinstance(target, DTensor):
+        if isinstance(value, DTensor):
+            if value.device_mesh != target.device_mesh or value.placements != target.placements:
+                value = value.redistribute(device_mesh=target.device_mesh, placements=target.placements)
+            if value.dtype != target.dtype:
+                value = value.to(dtype=target.dtype)
+            target.copy_(value)
+            return
+
+        local_target = target.to_local()
+        checkpoint_value = value.to(device=local_target.device, dtype=target.dtype)
+        distributed_value = distribute_tensor(
+            checkpoint_value,
+            device_mesh=target.device_mesh,
+            placements=target.placements,
+        )
+        target.copy_(distributed_value)
+        return
+
+    if isinstance(value, DTensor):
+        value = value.full_tensor()
+
+    target.copy_(value.to(device=target.device, dtype=target.dtype))
 
 
 class RunState(Stateful):
@@ -56,7 +88,7 @@ class RunState(Stateful):
         # Load adapter weights
         for key, value in state_dict["model"].items():
             if key in self.model_state_dict:
-                self.model_state_dict[key].copy_(value)
+                _copy_checkpoint_tensor(self.model_state_dict[key], value)
         # Load optimizer
         if "optimizer" in state_dict and self.optimizer is not None:
             self.optimizer.load_state_dict(state_dict["optimizer"])
@@ -107,20 +139,44 @@ class MultiCheckpointManager:
             return False
         if step <= 0 or step % ckpt_config.interval != 0:
             return False
+        manager = self.managers[idx]
+        assert manager is not None
         # Check if already saved this step
-        return step not in self.managers[idx].ckpt_steps
+        return step not in manager.ckpt_steps
 
+    @overload
     def save(
         self,
         optimizer: "MultiLoRAOptimizer",
         scheduler: "MultiLoRAScheduler",
-    ) -> None:
+    ) -> None: ...
+
+    @overload
+    def save(
+        self,
+        step: int,
+        model: torch.nn.Module,
+        optimizers: list["MultiLoRAOptimizer"],
+        scheduler: "MultiLoRAScheduler",
+        progress: Progress,
+    ) -> None: ...
+
+    def save(self, *args: Any) -> None:
+        if len(args) == 2:
+            optimizer, scheduler = args
+        elif len(args) == 5:
+            _, _, optimizers, scheduler, _ = args
+            optimizer = optimizers[0]
+        else:
+            raise TypeError(f"MultiCheckpointManager.save expected 2 or 5 arguments, got {len(args)}")
+
         for idx in self.multi_run_manager.used_idxs:
             step = self.multi_run_manager.progress[idx].step
             if not self._should_save(idx, step):
                 continue
 
             manager = self.managers[idx]
+            assert manager is not None
 
             # We have a very wide try-except because we dont want to crash the trainer over one run having issues
             try:
@@ -180,17 +236,15 @@ class MultiCheckpointManager:
         optimizer: "MultiLoRAOptimizer",
         scheduler: "MultiLoRAScheduler",
     ) -> bool:
-        if (
-            self.multi_run_manager.config[idx].ckpt is None
-            or self.multi_run_manager.config[idx].ckpt.resume_step is None
-        ):
+        ckpt_config = self.multi_run_manager.config[idx].ckpt
+        if ckpt_config is None or ckpt_config.resume_step is None:
             return False
 
         manager = self.managers[idx]
         if manager is None:
             return False
 
-        step = self.multi_run_manager.config[idx].ckpt.resume_step
+        step = ckpt_config.resume_step
         if step == -1:
             stable_steps = get_stable_ckpt_steps(manager.ckpt_dir)
             if not stable_steps:
