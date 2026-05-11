@@ -1,0 +1,93 @@
+output_dir = "outputs/mu-rl-32b-think-lr5e-6"
+clean_output_dir = false
+max_steps = 100
+seq_len = 4096
+max_async_level = 1
+
+[deployment]
+gpus_per_node = 3
+num_train_gpus = 1
+num_infer_gpus = 2
+
+[model]
+name = "Qwen/Qwen3-32B"
+
+[wandb]
+project = "model-understanding-rl"
+name = "mu-rl-32b-think-lr5e-6"
+offline = false
+shared = true
+
+[ckpt]
+interval = 100
+keep_last = 10
+resume_step = 0
+
+[orchestrator]
+batch_size = 32
+rollouts_per_example = 16
+max_inflight_rollouts = 80
+max_off_policy_steps = 3
+use_token_client = true
+
+[orchestrator.train]
+num_workers = 1
+max_retries = 0
+
+[orchestrator.train.sampling]
+temperature = 1.0
+max_completion_tokens = 2048
+
+[[orchestrator.train.env]]
+id = "model-understanding-rl"
+name = "model_understanding"
+args = { dataset_path = "/workspace-vast/adamk/activation_oracles_dev/investigations/model_understanding_prime_rl/results/prime_mu_32b_investigation_only_dataset/train.jsonl", dataset_split = "train", tokenizer_name = "Qwen/Qwen3-32B", tokenizer_trust_remote_code = false, chat_template_kwargs = { enable_thinking = true }, judge_model = "claude-haiku-4-5-20251001", judge_concurrency = 80, judge_thinking_budget = 1024, judge_max_tokens = 1400, judge_mode = "thinking_json", strip_thinking = true, transcript_dir = "/workspace-vast/adamk/prime-rl/transcripts/32b-reasoning" }
+timeout = 300
+
+[orchestrator.client]
+base_url = ["http://localhost:19183/v1"]
+skip_model_check = true
+
+[trainer]
+max_concurrent_runs = 2
+
+[trainer.model]
+optimization_dtype = "bfloat16"
+reduce_dtype = "bfloat16"
+
+[trainer.model.ac]
+mode = "full"
+
+[trainer.model.lora]
+rank = 64
+alpha = 128.0
+dropout = 0.05
+target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+[trainer.optim]
+lr = 5e-6
+
+[trainer.ckpt.weights]
+save_adapter_separately = true
+
+[inference]
+gpu_memory_utilization = 0.90
+data_parallel_rpc_port = 24183
+
+[inference.server]
+port = 19183
+
+[inference.model]
+max_model_len = 5000
+enforce_eager = false
+
+[inference.vllm_extra.default_chat_template_kwargs]
+enable_thinking = true
+
+[slurm]
+job_name = "prime-mu-32b-4g"
+project_dir = "/workspace-vast/adamk/prime-rl"
+template_path = "/workspace-vast/adamk/prime-rl/cluster_templates/single_node_rl_shared.sbatch.j2"
+partition = "general"
+time = "12:00:00"
+exclude = "node-1,node-2,node-5,node-11,node-18,node-25"
