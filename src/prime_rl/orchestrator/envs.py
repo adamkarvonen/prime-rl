@@ -68,7 +68,7 @@ class Env:
         else:
             address = self.config.address
         get_logger().debug(f"Connecting {self.name} to env server {address}")
-        self._env_client = ZMQEnvClient(address=address, name=self.name)
+        self._env_client = ZMQEnvClient(address=address, name=self.name, startup_timeout=1200)
         await self.env_client.wait_for_server_startup()
 
     def _spawn(
