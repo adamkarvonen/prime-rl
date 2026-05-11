@@ -424,8 +424,8 @@ need to be concatenated into a single adapter.
 The combination and verification scripts live in the activation-oracles repo:
 
 ```text
-/workspace-vast/adamk/activation_oracles_dev/investigations/model_understanding_prime_rl/combine_lora_adapters.py
-/workspace-vast/adamk/activation_oracles_dev/investigations/model_understanding_prime_rl/verify_combined_lora.py
+/workspace-vast/adamk/activation_oracles_dev/investigations/model_understanding_prime_rl/lora_tools/combine_lora_adapters.py
+/workspace-vast/adamk/activation_oracles_dev/investigations/model_understanding_prime_rl/lora_tools/verify_combined_lora.py
 ```
 
 Run them with the activation-oracles `.venv`. They have no Slurm dependencies
@@ -441,13 +441,18 @@ adapter uses `alpha=256, r=128` to preserve the original `alpha/r=2.0` scaling.
 
 ```bash
 cd /workspace-vast/adamk/activation_oracles_dev
-.venv/bin/python investigations/model_understanding_prime_rl/combine_lora_adapters.py \
+.venv/bin/python investigations/model_understanding_prime_rl/lora_tools/combine_lora_adapters.py \
   --sft-adapter checkpoints_text_sft/mu_qwen3_8b_50k_s7_synth_e1_kl1/final \
-  --rl-adapter /workspace-vast/adamk/prime-rl/outputs/<RL_RUN_DIR>/weights/step_<N>/lora_adapters \
+  --rl-adapter /workspace-vast/adamk/prime-rl/outputs/<RL_RUN_DIR>/run_default/broadcasts/step_<N> \
   --output-dir checkpoints_text_sft/<OUTPUT_NAME>_combined \
   --base-model Qwen/Qwen3-8B \
   --from-sft-weights
 ```
+
+Current runs use `skip_gather_master_weights = true`, so full merged weights are
+never written to disk. The RL LoRA is instead found under
+`run_default/broadcasts/step_<N>/` (not `weights/step_<N>/lora_adapters/`). The
+combine script handles both key-prefix formats automatically.
 
 `--from-sft-weights` uses the raw stored SFT LoRA weights (fast, simple). Omit
 the flag and pass `--merged-model-dir <path>` to instead extract the SFT delta
@@ -472,7 +477,7 @@ bfloat16 storage of LoRA factors. Expected max abs diff: ~2.5e-3, max rel diff:
 
 ```bash
 cd /workspace-vast/adamk/activation_oracles_dev
-.venv/bin/python investigations/model_understanding_prime_rl/verify_combined_lora.py \
+.venv/bin/python investigations/model_understanding_prime_rl/lora_tools/verify_combined_lora.py \
   --base-model-dir <HF_CACHE_PATH_TO_Qwen3-8B> \
   --merged-model-dir /workspace-vast/adamk/prime-rl/outputs/mu_qwen3_8b_50k_s7_synth_e1_kl1_merged \
   --rl-adapter /workspace-vast/adamk/prime-rl/outputs/<RL_RUN_DIR>/weights/step_<N>/lora_adapters \
