@@ -76,6 +76,22 @@ def _copy_checkpoint_tensor(target: Tensor | DTensor, value: Tensor | DTensor) -
     target.copy_(value.to(device=target.device, dtype=target.dtype))
 
 
+def _adapter_only_model_key(adapter_key: str, model_state: dict[str, nn.Parameter]) -> str:
+    if adapter_key in model_state:
+        return adapter_key
+
+    for lora_name in ("lora_A", "lora_B"):
+        suffix = f".{lora_name}.weight"
+        if adapter_key.endswith(suffix):
+            model_key = adapter_key[: -len(suffix)] + f".{lora_name}.0"
+            assert model_key in model_state, (
+                f"Adapter-only checkpoint key {adapter_key} maps to {model_key}, but that key is not in the model."
+            )
+            return model_key
+
+    raise AssertionError(f"Adapter-only checkpoint key {adapter_key} is not in the model.")
+
+
 @torch.no_grad()
 def _load_adapter_only_checkpoint(
     path: Path,
@@ -88,11 +104,9 @@ def _load_adapter_only_checkpoint(
     model_state = dict(model.named_parameters())
     adapter_state = load_file(adapter_path, device="cpu")
 
-    missing = sorted(set(adapter_state) - set(model_state))
-    assert not missing, f"Adapter-only checkpoint contains keys not found in model: {missing}"
-
     for key, value in adapter_state.items():
-        _copy_checkpoint_tensor(model_state[key], value)
+        model_key = _adapter_only_model_key(key, model_state)
+        _copy_checkpoint_tensor(model_state[model_key], value)
 
     scheduler_path = path / "scheduler.pt"
     assert scheduler_path.exists(), f"Adapter-only checkpoint is missing {scheduler_path}."

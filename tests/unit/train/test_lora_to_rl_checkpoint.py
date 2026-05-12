@@ -4,7 +4,7 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
-from prime_rl.trainer.ckpt import ADAPTER_ONLY_MARKER
+from prime_rl.trainer.ckpt import ADAPTER_MODEL_NAME, ADAPTER_ONLY_MARKER, _load_adapter_only_checkpoint
 from prime_rl.tools.lora_to_rl_checkpoint import convert_adapter, convert_adapter_to_checkpoint, load_rl_config
 
 
@@ -85,6 +85,39 @@ def _write_adapter(adapter_dir: Path, rank: int = 2, alpha: float = 4.0) -> None
         },
         adapter_dir / "adapter_model.safetensors",
     )
+
+
+class _SingleRunLoRAModule(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lora_A = torch.nn.ParameterList([torch.nn.Parameter(torch.zeros(2, 3))])
+        self.lora_B = torch.nn.ParameterList([torch.nn.Parameter(torch.zeros(4, 2))])
+
+
+class _SingleRunModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.q_proj = _SingleRunLoRAModule()
+
+
+def test_adapter_only_loader_maps_export_keys_to_single_run_parameter_list(tmp_path: Path) -> None:
+    ckpt_dir = tmp_path / "trainer"
+    ckpt_dir.mkdir()
+    save_file(
+        {
+            "q_proj.lora_A.weight": torch.ones(2, 3),
+            "q_proj.lora_B.weight": torch.full((4, 2), 2.0),
+        },
+        ckpt_dir / ADAPTER_MODEL_NAME,
+    )
+    torch.save({}, ckpt_dir / "scheduler.pt")
+    torch.save({"step": 0}, ckpt_dir / "progress.pt")
+
+    model = _SingleRunModel()
+    _load_adapter_only_checkpoint(ckpt_dir, model, scheduler=None, progress=None)
+
+    assert torch.equal(model.q_proj.lora_A[0], torch.ones(2, 3))
+    assert torch.equal(model.q_proj.lora_B[0], torch.full((4, 2), 2.0))
 
 
 def test_convert_adapter_to_checkpoint_writes_multi_run_prime_rl_step_zero(tmp_path: Path) -> None:
