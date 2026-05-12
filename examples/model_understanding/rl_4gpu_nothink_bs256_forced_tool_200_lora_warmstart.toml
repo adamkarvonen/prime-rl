@@ -1,4 +1,4 @@
-output_dir = "outputs/mu-rl-lora-warmstart-nothink-bs256-ft-200-v2"
+output_dir = "outputs/mu-rl-lora-warmstart-nothink-bs256-ft-200-v3"
 clean_output_dir = false
 max_steps = 200
 seq_len = 4096
@@ -18,7 +18,7 @@ chat_template = "/workspace-vast/adamk/activation_oracles_dev/checkpoints_text_s
 
 [wandb]
 project = "model-understanding-rl"
-name = "mu-rl-lora-warmstart-nothink-bs256-ft-200-v2"
+name = "mu-rl-lora-warmstart-nothink-bs256-ft-200-v3"
 offline = false
 shared = true
 
@@ -53,7 +53,7 @@ max_completion_tokens = 512
 [[orchestrator.train.env]]
 id = "model-understanding-rl"
 name = "model_understanding"
-args = { dataset_path = "/workspace-vast/adamk/activation_oracles_dev/investigations/model_understanding_prime_rl/results/prime_mu_investigation_only_dataset/train.jsonl", dataset_split = "train", tokenizer_name = "/workspace-vast/adamk/activation_oracles_dev/checkpoints_text_sft/mu_qwen3_8b_50k_s7_synth_e1_kl1/final", tokenizer_trust_remote_code = false, chat_template_kwargs = { enable_thinking = false }, judge_model = "claude-haiku-4-5-20251001", judge_concurrency = 80, judge_max_tokens = 600, judge_mode = "forced_tool", judge_thinking_budget = 1024, transcript_dir = "/workspace-vast/adamk/prime-rl/transcripts/lora-warmstart-nothink-bs256-ft-200-v2" }
+args = { dataset_path = "/workspace-vast/adamk/activation_oracles_dev/investigations/model_understanding_prime_rl/results/prime_mu_investigation_only_dataset/train.jsonl", dataset_split = "train", tokenizer_name = "/workspace-vast/adamk/activation_oracles_dev/checkpoints_text_sft/mu_qwen3_8b_50k_s7_synth_e1_kl1/final", tokenizer_trust_remote_code = false, chat_template_kwargs = { enable_thinking = false }, judge_model = "claude-haiku-4-5-20251001", judge_concurrency = 80, judge_max_tokens = 600, judge_mode = "forced_tool", judge_thinking_budget = 1024, transcript_dir = "/workspace-vast/adamk/prime-rl/transcripts/lora-warmstart-nothink-bs256-ft-200-v3" }
 timeout = 300
 
 [orchestrator.client]
@@ -61,7 +61,7 @@ base_url = ["http://localhost:19183/v1"]
 skip_model_check = true
 
 [trainer]
-max_concurrent_runs = 2
+max_concurrent_runs = 1
 
 [trainer.model]
 optimization_dtype = "bfloat16"
@@ -79,6 +79,7 @@ lr = 5e-6
 [trainer.ckpt]
 skip_gather_master_weights = true
 weights_only = false
+skip_optimizer = true
 
 [trainer.ckpt.weights]
 save_adapter_separately = true
@@ -98,7 +99,7 @@ enforce_eager = false
 enable_thinking = false
 
 [slurm]
-job_name = "prime-mu-ws-200v2"
+job_name = "prime-mu-ws-200v3"
 project_dir = "/workspace-vast/adamk/prime-rl"
 template_path = "/workspace-vast/adamk/prime-rl/cluster_templates/single_node_rl_shared.sbatch.j2"
 partition = "general"

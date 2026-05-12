@@ -1,4 +1,4 @@
-"""Convert a PEFT LoRA adapter into a PrimeRL multi-run step checkpoint."""
+"""Convert a PEFT LoRA adapter into a PrimeRL warm-start checkpoint."""
 
 from __future__ import annotations
 
@@ -12,10 +12,12 @@ from typing import Any
 
 import torch
 import tomllib
+from torch.distributed.checkpoint.state_dict_saver import save as dcp_save
 from safetensors.torch import load_file, save_file
 
 from prime_rl.configs.rl import RLConfig
 from prime_rl.orchestrator.ckpt import Progress as OrchestratorProgress
+from prime_rl.trainer.scheduler import setup_scheduler
 from prime_rl.trainer.runs import Progress as TrainerProgress
 
 ADAPTER_CONFIG_NAME = "adapter_config.json"
@@ -57,8 +59,8 @@ def load_rl_config(config_path: Path, output_dir: Path | None) -> RLConfig:
 def settings_from_rl_config(config: RLConfig, step: int) -> WarmStartSettings:
     trainer_lora = config.trainer.model.lora
     assert trainer_lora is not None, "Trainer config must enable model.lora."
-    assert config.trainer.max_concurrent_runs > 1, (
-        "This converter writes PrimeRL multi-run checkpoints. Set trainer.max_concurrent_runs > 1."
+    assert config.trainer.max_concurrent_runs >= 1, (
+        f"trainer.max_concurrent_runs must be >= 1, got {config.trainer.max_concurrent_runs}."
     )
     assert config.trainer.ckpt is not None, "Trainer checkpoint config is required."
     assert config.orchestrator.ckpt is not None, "Orchestrator checkpoint config is required."
@@ -68,6 +70,12 @@ def settings_from_rl_config(config: RLConfig, step: int) -> WarmStartSettings:
     assert config.orchestrator.ckpt.resume_step == step, (
         f"orchestrator.ckpt.resume_step must equal converter step {step}, got {config.orchestrator.ckpt.resume_step}."
     )
+    if config.trainer.max_concurrent_runs == 1:
+        assert step == 0, "Single-run LoRA warm-start checkpoints only support step 0."
+        assert config.trainer.ckpt.skip_optimizer, (
+            "Single-run LoRA warm-start checkpoints intentionally do not include optimizer state. "
+            "Set trainer.ckpt.skip_optimizer = true."
+        )
 
     dtype_map = {
         "bfloat16": torch.bfloat16,
@@ -203,6 +211,7 @@ def convert_adapter(adapter_dir: Path, settings: WarmStartSettings) -> Converted
 
 def write_prime_rl_checkpoint(
     converted: ConvertedAdapter,
+    config: RLConfig,
     output_dir: Path,
     run_id: str,
     step: int,
@@ -211,25 +220,48 @@ def write_prime_rl_checkpoint(
 ) -> Path:
     assert trainer_rank_count >= 1, f"trainer_rank_count must be >= 1, got {trainer_rank_count}."
 
-    step_dir = output_dir / run_id / "checkpoints" / f"step_{step}"
-    if step_dir.exists():
-        assert overwrite, f"Checkpoint directory already exists: {step_dir}"
-        shutil.rmtree(step_dir)
+    run_step_dir = output_dir / run_id / "checkpoints" / f"step_{step}"
+    if run_step_dir.exists():
+        assert overwrite, f"Checkpoint directory already exists: {run_step_dir}"
+        shutil.rmtree(run_step_dir)
 
-    trainer_dir = step_dir / "trainer"
-    orchestrator_dir = step_dir / "orchestrator"
+    orchestrator_dir = run_step_dir / "orchestrator"
     buffer_dir = orchestrator_dir / "buffer"
-    weight_dir = step_dir / "weight"
-    trainer_dir.mkdir(parents=True)
+    weight_dir = run_step_dir / "weight"
     buffer_dir.mkdir(parents=True)
     weight_dir.mkdir(parents=True)
 
-    trainer_state = {
-        "model": converted.trainer_state_dict,
-        "progress": asdict(TrainerProgress(step=step)),
-    }
-    for rank in range(trainer_rank_count):
-        torch.save(trainer_state, trainer_dir / f"rank_{rank}.pt")
+    trainer_ckpt_dir: Path
+    if config.trainer.max_concurrent_runs == 1:
+        trainer_step_dir = output_dir / "checkpoints" / f"step_{step}"
+        if trainer_step_dir.exists():
+            assert overwrite, f"Checkpoint directory already exists: {trainer_step_dir}"
+            shutil.rmtree(trainer_step_dir)
+        trainer_ckpt_dir = trainer_step_dir / "trainer"
+        trainer_ckpt_dir.mkdir(parents=True)
+        scheduler_state = _initial_scheduler_state(config)
+        dcp_save(
+            {
+                "app": {
+                    "model": converted.trainer_state_dict,
+                    "optimizers": {},
+                    "scheduler": scheduler_state,
+                    "progress": asdict(TrainerProgress(step=step)),
+                }
+            },
+            checkpoint_id=trainer_ckpt_dir,
+            no_dist=True,
+        )
+        (trainer_step_dir / "STABLE").touch()
+    else:
+        trainer_ckpt_dir = run_step_dir / "trainer"
+        trainer_ckpt_dir.mkdir(parents=True)
+        trainer_state = {
+            "model": converted.trainer_state_dict,
+            "progress": asdict(TrainerProgress(step=step)),
+        }
+        for rank in range(trainer_rank_count):
+            torch.save(trainer_state, trainer_ckpt_dir / f"rank_{rank}.pt")
 
     with open(orchestrator_dir / "progress.pt", "wb") as f:
         torch.save({"progress": OrchestratorProgress(step=step)}, f)
@@ -241,17 +273,31 @@ def write_prime_rl_checkpoint(
     (weight_dir / "STABLE").touch()
 
     metadata = {
-        "format": "prime_rl_multi_run_lora_warm_start",
+        "format": "prime_rl_lora_warm_start",
         "run_id": run_id,
         "step": step,
+        "max_concurrent_runs": config.trainer.max_concurrent_runs,
         "trainer_rank_count": trainer_rank_count,
+        "trainer_checkpoint_dir": str(trainer_ckpt_dir),
         "num_tensors": len(converted.trainer_state_dict),
         "torch_dtype": str(next(iter(converted.trainer_state_dict.values())).dtype),
         "adapter_config": converted.adapter_config,
     }
-    (step_dir / "conversion_metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
-    (step_dir / "STABLE").touch()
-    return step_dir
+    (run_step_dir / "conversion_metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    (run_step_dir / "STABLE").touch()
+    return run_step_dir
+
+
+def _initial_scheduler_state(config: RLConfig) -> dict[str, Any]:
+    dummy_param = torch.nn.Parameter(torch.zeros(()))
+    dummy_optimizer = torch.optim.AdamW([dummy_param], lr=config.trainer.optim.lr)
+    scheduler = setup_scheduler(
+        dummy_optimizer,
+        config.trainer.scheduler,
+        config.trainer.max_steps,
+        config.trainer.optim.lr,
+    )
+    return scheduler.state_dict()
 
 
 def convert_adapter_to_checkpoint(
@@ -268,6 +314,7 @@ def convert_adapter_to_checkpoint(
     converted = convert_adapter(adapter_dir, settings)
     return write_prime_rl_checkpoint(
         converted=converted,
+        config=config,
         output_dir=output_dir,
         run_id=run_id,
         step=step,

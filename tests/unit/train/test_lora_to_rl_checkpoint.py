@@ -7,7 +7,14 @@ from safetensors.torch import load_file, save_file
 from prime_rl.tools.lora_to_rl_checkpoint import convert_adapter, convert_adapter_to_checkpoint, load_rl_config
 
 
-def _write_rl_config(path: Path, output_dir: Path, rank: int = 2, alpha: float = 4.0) -> None:
+def _write_rl_config(
+    path: Path,
+    output_dir: Path,
+    rank: int = 2,
+    alpha: float = 4.0,
+    max_concurrent_runs: int = 2,
+) -> None:
+    single_run_ckpt = "skip_optimizer = true" if max_concurrent_runs == 1 else ""
     path.write_text(
         f"""
 output_dir = "{output_dir.as_posix()}"
@@ -17,11 +24,14 @@ seq_len = 128
 [ckpt]
 resume_step = 0
 
+[trainer.ckpt]
+{single_run_ckpt}
+
 [model]
 name = "Base/Model"
 
 [trainer]
-max_concurrent_runs = 2
+max_concurrent_runs = {max_concurrent_runs}
 
 [trainer.model.lora]
 rank = {rank}
@@ -76,7 +86,7 @@ def _write_adapter(adapter_dir: Path, rank: int = 2, alpha: float = 4.0) -> None
     )
 
 
-def test_convert_adapter_to_checkpoint_writes_prime_rl_step_zero(tmp_path: Path) -> None:
+def test_convert_adapter_to_checkpoint_writes_multi_run_prime_rl_step_zero(tmp_path: Path) -> None:
     adapter_dir = tmp_path / "adapter"
     output_dir = tmp_path / "outputs"
     config_path = tmp_path / "rl.toml"
@@ -115,6 +125,41 @@ def test_convert_adapter_to_checkpoint_writes_prime_rl_step_zero(tmp_path: Path)
     assert orchestrator_state["progress"].step == 0
     for filename in ("easy_examples.jsonl", "hard_examples.jsonl", "rollout_buffer.jsonl"):
         assert (step_dir / "orchestrator" / "buffer" / filename).read_text() == ""
+
+
+def test_convert_adapter_to_checkpoint_writes_single_run_prime_rl_step_zero(tmp_path: Path) -> None:
+    adapter_dir = tmp_path / "adapter"
+    output_dir = tmp_path / "outputs"
+    config_path = tmp_path / "rl.toml"
+    _write_adapter(adapter_dir)
+    _write_rl_config(config_path, output_dir, max_concurrent_runs=1)
+
+    step_dir = convert_adapter_to_checkpoint(
+        adapter_dir=adapter_dir,
+        rl_config_path=config_path,
+        output_dir=output_dir,
+        run_id="run_default",
+        step=0,
+        trainer_rank_count=1,
+        overwrite=False,
+    )
+
+    assert step_dir == output_dir / "run_default" / "checkpoints" / "step_0"
+    trainer_dir = output_dir / "checkpoints" / "step_0" / "trainer"
+    assert (output_dir / "checkpoints" / "step_0" / "STABLE").exists()
+    assert (trainer_dir / ".metadata").exists()
+    assert any(path.name.endswith(".distcp") for path in trainer_dir.iterdir())
+
+    assert (step_dir / "STABLE").exists()
+    weight_state = load_file(step_dir / "weight" / "adapter_model.safetensors", device="cpu")
+    assert set(weight_state) == {
+        "model.layers.0.self_attn.q_proj.lora_A.weight",
+        "model.layers.0.self_attn.q_proj.lora_B.weight",
+    }
+
+    metadata = (step_dir / "conversion_metadata.json").read_text()
+    assert '"max_concurrent_runs": 1' in metadata
+    assert f'"trainer_checkpoint_dir": "{trainer_dir.as_posix()}"' in metadata
 
 
 def test_convert_adapter_to_checkpoint_writes_each_trainer_rank(tmp_path: Path) -> None:
