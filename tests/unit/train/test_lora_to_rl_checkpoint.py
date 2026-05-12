@@ -4,6 +4,7 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
+from prime_rl.trainer.ckpt import ADAPTER_ONLY_MARKER
 from prime_rl.tools.lora_to_rl_checkpoint import convert_adapter, convert_adapter_to_checkpoint, load_rl_config
 
 
@@ -147,15 +148,21 @@ def test_convert_adapter_to_checkpoint_writes_single_run_prime_rl_step_zero(tmp_
     assert step_dir == output_dir / "run_default" / "checkpoints" / "step_0"
     trainer_dir = output_dir / "checkpoints" / "step_0" / "trainer"
     assert (output_dir / "checkpoints" / "step_0" / "STABLE").exists()
-    assert (trainer_dir / ".metadata").exists()
-    assert any(path.name.endswith(".distcp") for path in trainer_dir.iterdir())
+    assert (trainer_dir / ADAPTER_ONLY_MARKER).exists()
+    assert (trainer_dir / "adapter_model.safetensors").exists()
+    assert (trainer_dir / "scheduler.pt").exists()
+    assert (trainer_dir / "progress.pt").exists()
 
     assert (step_dir / "STABLE").exists()
+    trainer_state = load_file(trainer_dir / "adapter_model.safetensors", device="cpu")
     weight_state = load_file(step_dir / "weight" / "adapter_model.safetensors", device="cpu")
-    assert set(weight_state) == {
+    expected_keys = {
         "model.layers.0.self_attn.q_proj.lora_A.weight",
         "model.layers.0.self_attn.q_proj.lora_B.weight",
     }
+    assert set(trainer_state) == expected_keys
+    assert set(weight_state) == expected_keys
+    assert torch.load(trainer_dir / "progress.pt", weights_only=False)["step"] == 0
 
     metadata = (step_dir / "conversion_metadata.json").read_text()
     assert '"max_concurrent_runs": 1' in metadata

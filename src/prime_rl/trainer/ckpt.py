@@ -13,12 +13,13 @@ from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_di
 from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
 from torch.distributed.checkpoint.state_dict_saver import save as dcp_save
 from torch.distributed.checkpoint.stateful import Stateful
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, distribute_tensor
 from torch.nn import Module
 from torch.optim.lr_scheduler import LRScheduler
 from torch.optim.optimizer import Optimizer
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.tokenization_utils import PreTrainedTokenizer
+from safetensors.torch import load_file
 
 from prime_rl.configs.trainer import CheckpointConfig, LoRAConfig, WeightCheckpointConfig
 from prime_rl.trainer.lora import has_lora_layers, save_lora_config
@@ -33,6 +34,9 @@ from prime_rl.trainer.world import get_world
 from prime_rl.utils.logger import get_logger
 from prime_rl.utils.utils import get_all_ckpt_steps, get_ckpt_dir, get_step_path, get_weights_dir
 
+ADAPTER_ONLY_MARKER = "ADAPTER_ONLY_LORA"
+ADAPTER_MODEL_NAME = "adapter_model.safetensors"
+
 
 def _try_rmtree(path: Path, logger) -> None:
     """Remove a directory tree, logging and skipping on failure."""
@@ -40,6 +44,67 @@ def _try_rmtree(path: Path, logger) -> None:
         shutil.rmtree(path)
     except OSError as e:
         logger.warning(f"Failed to remove {path}: {e}, skipping cleanup")
+
+
+def _copy_checkpoint_tensor(target: Tensor | DTensor, value: Tensor | DTensor) -> None:
+    assert tuple(target.shape) == tuple(value.shape), (
+        f"Checkpoint tensor shape mismatch: target {tuple(target.shape)} vs checkpoint {tuple(value.shape)}"
+    )
+
+    if isinstance(target, DTensor):
+        if isinstance(value, DTensor):
+            if value.device_mesh != target.device_mesh or value.placements != target.placements:
+                value = value.redistribute(device_mesh=target.device_mesh, placements=target.placements)
+            if value.dtype != target.dtype:
+                value = value.to(dtype=target.dtype)
+            target.copy_(value)
+            return
+
+        local_target = target.to_local()
+        checkpoint_value = value.to(device=local_target.device, dtype=target.dtype)
+        distributed_value = distribute_tensor(
+            checkpoint_value,
+            device_mesh=target.device_mesh,
+            placements=target.placements,
+        )
+        target.copy_(distributed_value)
+        return
+
+    if isinstance(value, DTensor):
+        value = value.full_tensor()
+
+    target.copy_(value.to(device=target.device, dtype=target.dtype))
+
+
+@torch.no_grad()
+def _load_adapter_only_checkpoint(
+    path: Path,
+    model: nn.Module,
+    scheduler: LRScheduler | None,
+    progress: Progress | None,
+) -> None:
+    adapter_path = path / ADAPTER_MODEL_NAME
+    assert adapter_path.exists(), f"Adapter-only checkpoint is missing {adapter_path}."
+    model_state = dict(model.named_parameters())
+    adapter_state = load_file(adapter_path, device="cpu")
+
+    missing = sorted(set(adapter_state) - set(model_state))
+    assert not missing, f"Adapter-only checkpoint contains keys not found in model: {missing}"
+
+    for key, value in adapter_state.items():
+        _copy_checkpoint_tensor(model_state[key], value)
+
+    scheduler_path = path / "scheduler.pt"
+    assert scheduler_path.exists(), f"Adapter-only checkpoint is missing {scheduler_path}."
+    if scheduler is not None:
+        scheduler.load_state_dict(torch.load(scheduler_path, weights_only=False))
+
+    progress_path = path / "progress.pt"
+    assert progress_path.exists(), f"Adapter-only checkpoint is missing {progress_path}."
+    if progress is not None:
+        progress_state = torch.load(progress_path, weights_only=False)
+        for key, value in progress_state.items():
+            setattr(progress, key, value)
 
 
 class AppState(Stateful):
@@ -192,10 +257,18 @@ class CheckpointManager:
         self.logger.debug(f"Loading training checkpoint from {path}")
         start_time = time.perf_counter()
 
-        # Load sharded state
-        app_state = AppState(model, optimizers if not self.skip_optimizer else [], scheduler, progress)
-        state_dict = {"app": app_state}
-        dcp_load(state_dict=state_dict, checkpoint_id=path)
+        if (path / ADAPTER_ONLY_MARKER).exists():
+            assert self.skip_optimizer, (
+                "Adapter-only LoRA warm-start checkpoints do not contain optimizer state. "
+                "Set trainer.ckpt.skip_optimizer = true."
+            )
+            assert dataloader is None, "Adapter-only LoRA warm-start checkpoints do not contain dataloader state."
+            _load_adapter_only_checkpoint(path, model, scheduler, progress)
+        else:
+            # Load sharded state
+            app_state = AppState(model, optimizers if not self.skip_optimizer else [], scheduler, progress)
+            state_dict = {"app": app_state}
+            dcp_load(state_dict=state_dict, checkpoint_id=path)
 
         # Load the dataloader
         if dataloader is not None:
@@ -421,7 +494,7 @@ class WeightCheckpointManager:
             )
         else:
             # For regular transformers models, revert internal format to original HF hub format
-            from transformers.core_model_loading import revert_weight_conversion
+            from transformers.core_model_loading import revert_weight_conversion  # ty: ignore[unresolved-import]
 
             self.logger.debug("Reverting transformers internal format to HF hub format for weight checkpoint")
             start_time = time.perf_counter()

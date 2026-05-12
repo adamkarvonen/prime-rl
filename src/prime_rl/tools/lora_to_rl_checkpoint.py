@@ -12,10 +12,10 @@ from typing import Any
 
 import torch
 import tomllib
-from torch.distributed.checkpoint.state_dict_saver import save as dcp_save
 from safetensors.torch import load_file, save_file
 
 from prime_rl.configs.rl import RLConfig
+from prime_rl.trainer.ckpt import ADAPTER_ONLY_MARKER
 from prime_rl.orchestrator.ckpt import Progress as OrchestratorProgress
 from prime_rl.trainer.scheduler import setup_scheduler
 from prime_rl.trainer.runs import Progress as TrainerProgress
@@ -240,18 +240,10 @@ def write_prime_rl_checkpoint(
         trainer_ckpt_dir = trainer_step_dir / "trainer"
         trainer_ckpt_dir.mkdir(parents=True)
         scheduler_state = _initial_scheduler_state(config)
-        dcp_save(
-            {
-                "app": {
-                    "model": converted.trainer_state_dict,
-                    "optimizers": {},
-                    "scheduler": scheduler_state,
-                    "progress": asdict(TrainerProgress(step=step)),
-                }
-            },
-            checkpoint_id=trainer_ckpt_dir,
-            no_dist=True,
-        )
+        save_file(converted.trainer_state_dict, trainer_ckpt_dir / ADAPTER_MODEL_NAME, metadata={"format": "pt"})
+        torch.save(scheduler_state, trainer_ckpt_dir / "scheduler.pt")
+        torch.save(asdict(TrainerProgress(step=step)), trainer_ckpt_dir / "progress.pt")
+        (trainer_ckpt_dir / ADAPTER_ONLY_MARKER).touch()
         (trainer_step_dir / "STABLE").touch()
     else:
         trainer_ckpt_dir = run_step_dir / "trainer"
