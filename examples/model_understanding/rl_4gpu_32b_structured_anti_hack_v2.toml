@@ -1,0 +1,112 @@
+# 32B RL run against the new strict structured GT + v2 anti-hack reward.
+#
+# Same env / reward / hyperparam shape as the parallel 8B run, on 4 GPUs total
+# (2 train, 2 inference). Per the bottleneck analysis (judge ~85% of per-rollout
+# wall time, GPU mostly idle), upgrading from 8B → 32B is effectively "free"
+# wall-clock since vLLM gen time is dwarfed by Sonnet judge latency.
+#
+# judge_concurrency raised 100 → 250 (org-wide rate limit is 1.2M output/min
+# and 15M input/min; current usage well below). Once concurrency exceeds the
+# per-step call count (128), throughput is gated by single-call latency, not
+# concurrency — 250 just gives headroom for slow-call pile-up.
+output_dir = "outputs/mu-rl-32b-structured-anti-hack-v2"
+clean_output_dir = true
+max_steps = 1000
+seq_len = 8192
+max_async_level = 1
+
+[deployment]
+gpus_per_node = 4
+num_train_gpus = 2
+num_infer_gpus = 2
+
+[model]
+name = "/workspace-vast/adamk/prime-rl/outputs/mu_qwen3_32b_structured_synth_e1_kl1_merged"
+
+[wandb]
+project = "model-understanding-rl"
+name = "mu-rl-32b-structured-anti-hack-v2"
+offline = false
+shared = true
+
+[ckpt]
+interval = 100
+keep_last = 10
+
+[orchestrator]
+batch_size = 128
+rollouts_per_example = 16
+max_inflight_rollouts = 128
+max_off_policy_steps = 4
+use_token_client = true
+filters = [
+    { type = "gibberish", enforce = false, token_id_threshold = 100000, logprob_offset = 2.0 },
+    { type = "repetition", enforce = false, window = 3000, prob_threshold = 0.99 },
+    { type = "zero_advantage", enforce = false },
+]
+
+[orchestrator.train]
+num_workers = 1
+max_retries = 0
+
+[orchestrator.train.sampling]
+temperature = 1.0
+max_completion_tokens = 2048  # max GT length is 950 tokens; 2048 = ~1100 buffer
+
+[[orchestrator.train.env]]
+id = "model-understanding-rl-structured"
+name = "model_understanding_rl_structured"
+args = { dataset_path = "/workspace-vast/adamk/activation_oracles_dev/investigations/model_understanding_prime_rl/results/prime_mu_32b_structured_dataset/train.jsonl", dataset_split = "train", tokenizer_name = "/workspace-vast/adamk/prime-rl/outputs/mu_qwen3_32b_structured_synth_e1_kl1_merged", tokenizer_trust_remote_code = false, chat_template_kwargs = { enable_thinking = false }, judge_model = "claude-sonnet-4-6", judge_concurrency = 250, judge_max_tokens = 4096, judge_thinking_budget = 1024, reward_reduction = "core_anti_hack_v2", reward_alpha_core = 0.20, reward_alpha_ref = 0.20, reward_format_fail_reward = -1.0, transcript_dir = "/workspace-vast/adamk/prime-rl/transcripts/32b-structured-anti-hack-v2" }
+timeout = 600
+
+[orchestrator.client]
+# Single URL — prime-rl's `configure_lora_inference_replicas` auto-expands this
+# into one URL per inference replica at runtime, sets dp_rank_count=1, and
+# round-robins across them. Do NOT list both ports manually; that triggers
+# the "expects one base URL before expansion" assertion.
+base_url = ["http://localhost:19293/v1"]
+
+[trainer.model]
+optimization_dtype = "bfloat16"
+reduce_dtype = "bfloat16"
+
+[trainer.model.ac]
+mode = "full"
+
+[trainer.model.lora]
+rank = 64
+alpha = 128.0
+dropout = 0.05
+target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+[trainer.optim]
+lr = 5e-6
+
+[trainer.ckpt]
+skip_gather_master_weights = true
+weights_only = false
+
+[trainer.ckpt.weights]
+save_adapter_separately = true
+
+[inference]
+gpu_memory_utilization = 0.90
+data_parallel_rpc_port = 24293
+
+[inference.server]
+port = 19293
+
+[inference.model]
+max_model_len = 8192
+enforce_eager = false
+
+[inference.vllm_extra.default_chat_template_kwargs]
+enable_thinking = false
+
+[slurm]
+job_name = "prime-mu-32b-structured-v2"
+project_dir = "/workspace-vast/adamk/prime-rl"
+template_path = "/workspace-vast/adamk/prime-rl/cluster_templates/single_node_rl_shared.sbatch.j2"
+partition = "general"
+time = "3-00:00:00"
+exclude = "node-1,node-2,node-3,node-4,node-5,node-11,node-16,node-18,node-25,node-27,node-29,node-30"

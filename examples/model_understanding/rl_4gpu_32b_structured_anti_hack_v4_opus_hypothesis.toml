@@ -1,0 +1,122 @@
+# 32B RL run — v4 reward (symmetric count penalty; addresses v3's risk-averse undershoot).
+#
+# v4 changes vs v3:
+#  - count_penalty is now SYMMETRIC (bidirectional) on |m - gt|:
+#      distance=0 → 0  | distance=1 → 0.05  | distance=2 → 0.20  | distance=3 → 0.35
+#    Core: applied to |m_core - gt_core|.
+#    Refuted: applied to max(0, |m_ref - gt_ref| - 1) (preserves ±1 free zone).
+#  - Rationale: v3 had one-directional overshoot penalty, which combined with the
+#    catastrophic (3,1) cell created a risk-averse equilibrium — model preferred
+#    safe undershoot (-0.24 lookup) over uncertain overshoot (could hit -0.60).
+#    v3 sat at m_core ≈ gt_core − 0.1, missing easy lookup score.
+#
+# Same as v3 (unchanged): LOOKUP_V3, length_penalty_v3, lr=3e-5.
+#
+# alpha_core/alpha_ref are intentionally not consumed by v4 (the symmetric helpers
+# replace flat alphas). Reduction code accepts the args via **_ for TOML compatibility.
+#
+# Concurrency 200 (vs v2's 250). Per-step calls = batch * rollouts = 128 * 16 = 2048;
+# concurrency only saturates when in-flight count >> single-call latency * call rate.
+# 200 is plenty of headroom and slightly easier on the org rate limit.
+output_dir = "outputs/mu-rl-32b-structured-anti-hack-v4-opus-hypothesis"
+clean_output_dir = true
+max_steps = 1000
+seq_len = 8192
+max_async_level = 1
+
+[deployment]
+gpus_per_node = 3
+num_train_gpus = 2
+num_infer_gpus = 1
+
+[model]
+name = "/workspace-vast/adamk/prime-rl/outputs/mu_qwen3_32b_structured_strict_opus_hypothesis_e1_kl0_merged"
+
+[wandb]
+project = "model-understanding-rl"
+name = "mu-rl-32b-structured-anti-hack-v4-opus-hypothesis"
+offline = false
+shared = true
+
+[ckpt]
+interval = 100
+keep_last = 10
+
+[orchestrator]
+batch_size = 128
+rollouts_per_example = 16
+max_inflight_rollouts = 128
+max_off_policy_steps = 4
+use_token_client = true
+filters = [
+    { type = "gibberish", enforce = false, token_id_threshold = 100000, logprob_offset = 2.0 },
+    { type = "repetition", enforce = false, window = 3000, prob_threshold = 0.99 },
+    { type = "zero_advantage", enforce = false },
+]
+
+[orchestrator.train]
+num_workers = 1
+max_retries = 0
+
+[orchestrator.train.sampling]
+temperature = 1.0
+max_completion_tokens = 2048  # max GT length is 950 tokens; 2048 = ~1100 buffer
+
+[[orchestrator.train.env]]
+id = "model-understanding-rl-structured"
+name = "model_understanding_rl_structured"
+args = { dataset_path = "/workspace-vast/adamk/activation_oracles_dev/investigations/model_understanding_prime_rl/results/prime_mu_32b_structured_opus_hypothesis_dataset/train.jsonl", dataset_split = "train", tokenizer_name = "/workspace-vast/adamk/prime-rl/outputs/mu_qwen3_32b_structured_strict_opus_hypothesis_e1_kl0_merged", tokenizer_trust_remote_code = false, chat_template_kwargs = { enable_thinking = false }, judge_model = "claude-sonnet-4-6", judge_concurrency = 100, judge_max_tokens = 4096, judge_thinking_budget = 1024, reward_reduction = "core_anti_hack_v4", reward_alpha_core = 0.20, reward_alpha_ref = 0.20, reward_format_fail_reward = -1.0, transcript_dir = "/workspace-vast/adamk/prime-rl/transcripts/32b-structured-anti-hack-v4-opus-hypothesis" }
+timeout = 600
+
+[orchestrator.client]
+# Single URL — prime-rl's `configure_lora_inference_replicas` auto-expands this
+# into one URL per inference replica at runtime, sets dp_rank_count=1, and
+# round-robins across them. Do NOT list both ports manually; that triggers
+# the "expects one base URL before expansion" assertion.
+base_url = ["http://localhost:19293/v1"]
+
+[trainer.model]
+optimization_dtype = "bfloat16"
+reduce_dtype = "bfloat16"
+
+[trainer.model.ac]
+mode = "full"
+
+[trainer.model.lora]
+rank = 64
+alpha = 128.0
+dropout = 0.05
+target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+[trainer.optim]
+lr = 3e-5  # bumped 6× from v2's 5e-6 — diagnose reward shape faster
+           # (effective LoRA scale lr × alpha/rank = 3e-5 × 2 = 6e-5)
+
+[trainer.ckpt]
+skip_gather_master_weights = true
+weights_only = false
+
+[trainer.ckpt.weights]
+save_adapter_separately = true
+
+[inference]
+gpu_memory_utilization = 0.90
+data_parallel_rpc_port = 24293
+
+[inference.server]
+port = 19293
+
+[inference.model]
+max_model_len = 8192
+enforce_eager = false
+
+[inference.vllm_extra.default_chat_template_kwargs]
+enable_thinking = false
+
+[slurm]
+job_name = "prime-mu-32b-structured-v4-opus-hyp"
+project_dir = "/workspace-vast/adamk/prime-rl"
+template_path = "/workspace-vast/adamk/prime-rl/cluster_templates/single_node_rl_shared.sbatch.j2"
+partition = "general"
+time = "3-00:00:00"
+exclude = "node-8"  # 2026-05-29: wenj process on assigned GPU; SLURM-zombie suspect, see investigation

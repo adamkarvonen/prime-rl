@@ -1,0 +1,14 @@
+[project]
+name = "model-understanding-rl-structured"
+version = "0.1.0"
+description = "Prime RL Verifiers environment for model-understanding — per-rollout structured-judge reward"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic",
+    "datasets",
+    "verifiers",
+]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
